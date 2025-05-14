@@ -186,9 +186,33 @@ async def get_stream_meta(stream_id: str) -> dict | None:
 
 async def get_active_stream_ids() -> list[str]:
     r = await get_redis_connection()
-    # stream_ids are already str because decode_responses=True
     stream_ids = await r.smembers("streams:active")
-    return list(stream_ids)  # Ensure it's a list of strings
+    return list(stream_ids)
+
+
+async def get_pending_completion_stream_ids() -> list[str]:
+    r = await get_redis_connection()
+    return list(await r.smembers("streams:pending_completion"))
+
+
+async def add_stream_to_failed_set(stream_id: str, reason: str = "unknown"):
+    """Marks a stream as failed and moves it to the failed set."""
+    r = await get_redis_connection()
+    async with r.pipeline(transaction=True) as pipe:
+        pipe.sadd("streams:failed", stream_id)
+        pipe.srem("streams:active", stream_id)
+        pipe.srem("streams:pending_completion", stream_id)
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        pipe.hset(
+            f"stream:{stream_id}:meta",
+            mapping={
+                "status": f"failed_{reason}",
+                "last_activity_at_utc": now_iso,
+                "failure_reason": reason,
+            },
+        )
+        await pipe.execute()
+    logger.info(f"Moved stream {stream_id} to streams:failed set. Reason: {reason}")
 
 
 async def move_stream_to_pending_completion(stream_id: str):

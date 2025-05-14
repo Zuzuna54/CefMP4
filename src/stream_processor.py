@@ -41,29 +41,72 @@ class StreamProcessor:
         )  # To prevent concurrent processing of the same file path by this instance
 
     async def _initialize_from_checkpoint(self):
-        # This method will be fully implemented in Phase 7 (Resume Logic) to load state from Redis.
-        # For Phase 4 (new streams), it is called but will likely find no existing state in Redis.
+        """Loads the processor's state from Redis based on its stream_id."""
+        logger.info(f"[{self.stream_id}] Attempting to initialize from checkpoint.")
         from src.redis_client import (
+            get_stream_meta,
             get_stream_next_part,
             get_stream_bytes_sent,
             get_stream_parts,
+            add_stream_to_failed_set,
         )
+
+        meta = await get_stream_meta(self.stream_id)
+        if not meta:
+            logger.warning(
+                f"[{self.stream_id}] No metadata found in Redis. Cannot initialize from checkpoint. Assuming new stream (problematic if called for resume)."
+            )
+            return
+
+        self.file_path = Path(meta.get("original_path", str(self.file_path)))
+        self.s3_upload_id = meta.get("s3_upload_id", self.s3_upload_id)
+        self.s3_bucket = meta.get("s3_bucket", self.s3_bucket)
+        self.s3_key_prefix = meta.get("s3_key_prefix", self.s3_key_prefix)
 
         next_part_redis = await get_stream_next_part(self.stream_id)
-        if next_part_redis is not None:
-            self.next_part_number = next_part_redis
-
         bytes_sent_redis = await get_stream_bytes_sent(self.stream_id)
-        if bytes_sent_redis is not None:
-            self.current_file_offset = bytes_sent_redis
-
         parts_redis = await get_stream_parts(self.stream_id)
+
         if parts_redis:
             self.uploaded_parts_info = parts_redis
+            # Derive next_part_number if not explicitly set or if parts_redis is more current
+            self.next_part_number = (
+                max(p["PartNumber"] for p in self.uploaded_parts_info) + 1
+            )
+            # Derive current_file_offset from sum of part sizes if not explicitly set or if parts_redis is more current
+            self.current_file_offset = sum(p["Size"] for p in self.uploaded_parts_info)
+        else:
+            self.uploaded_parts_info = []
+            self.next_part_number = 1
+            self.current_file_offset = 0
+
+        # Override with explicit Redis values if they exist, as they might be more authoritative
+        # for a partially resumed upload where parts_redis might not yet reflect the very last action.
+        if next_part_redis is not None:
+            self.next_part_number = int(next_part_redis)
+        if bytes_sent_redis is not None:
+            self.current_file_offset = int(bytes_sent_redis)
+
+        # Final consistency check if parts_redis was empty but explicit values were also not there
+        if not parts_redis and next_part_redis is None:
+            self.next_part_number = 1
+        if not parts_redis and bytes_sent_redis is None:
+            self.current_file_offset = 0
 
         logger.info(
-            f"[{self.stream_id}] Initialized processor state (or defaults): next_part={self.next_part_number}, offset={self.current_file_offset}, known_parts={len(self.uploaded_parts_info)}"
+            f"[{self.stream_id}] Initialized from checkpoint: File='{self.file_path}', next_part={self.next_part_number}, offset={self.current_file_offset}, known_parts={len(self.uploaded_parts_info)}, S3 UploadID='{self.s3_upload_id}'"
         )
+
+        if not self.file_path.exists():
+            logger.warning(
+                f"[{self.stream_id}] Original file {self.file_path} not found during checkpoint initialization. Stream cannot be processed further."
+            )
+            await add_stream_to_failed_set(
+                self.stream_id, reason="file_missing_on_resume"
+            )
+            raise FileNotFoundError(
+                f"Original file {self.file_path} missing for stream {self.stream_id}"
+            )
 
     async def process_file_write(self):
         """Handles a WRITE event, reads new data, chunks, and uploads."""

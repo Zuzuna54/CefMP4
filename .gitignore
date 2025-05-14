@@ -53,9 +53,3 @@ local_settings.py
 
 # minio
 minio_data/
-
-# Local watch directory
-local_watch_dir/
-
-# Pytest cache
-.pytest_cache/

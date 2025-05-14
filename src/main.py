@@ -13,12 +13,14 @@ from .redis_client import (
     close_redis_connection,
     get_redis_connection,
     get_active_stream_ids,
+    get_pending_completion_stream_ids,
     get_stream_meta,
     move_stream_to_pending_completion,
     remove_stream_from_active_set,
     remove_stream_from_pending_completion,
     set_stream_status,
     update_stream_last_activity,
+    add_stream_to_failed_set,
 )
 from .s3_client import create_s3_multipart_upload, close_s3_resources
 from .stream_processor import StreamProcessor
@@ -434,6 +436,93 @@ async def periodic_stale_stream_check(stop_event: asyncio.Event):
             )  # Avoid fast error loop
 
 
+async def resume_stream_processing(stream_id: str):
+    logger.info(f"Attempting to resume processing for stream_id: {stream_id}")
+    # Ensure add_stream_to_failed_set is available if needed for error cases
+    from .redis_client import add_stream_to_failed_set
+
+    meta = await get_stream_meta(stream_id)
+    if not meta:
+        logger.error(
+            f"No metadata found for stream_id: {stream_id} during resume. Skipping."
+        )
+        # Consider marking as failed if appropriate, e.g., if it was in an active set but meta disappeared
+        # await add_stream_to_failed_set(stream_id, "meta_missing_on_resume")
+        return
+
+    file_path_str = meta.get("original_path")
+    s3_upload_id = meta.get("s3_upload_id")
+    s3_bucket = meta.get("s3_bucket")
+    s3_key_prefix = meta.get("s3_key_prefix")
+    status = meta.get("status")
+
+    if not all([file_path_str, s3_upload_id, s3_bucket, s3_key_prefix]):
+        logger.error(
+            f"Incomplete metadata for stream_id: {stream_id} during resume. Skipping. Meta: {meta}"
+        )
+        await add_stream_to_failed_set(stream_id, "incomplete_meta_on_resume")
+        return
+
+    file_path = Path(file_path_str)
+
+    # Prevent re-adding if a processor for this path already exists from another resumed stream_id
+    # This is a simple check; more complex scenarios (e.g. same file, different stream_id if not cleaned up) might need more logic
+    if file_path in active_processors:
+        logger.warning(
+            f"Processor for {file_path} (from stream {active_processors[file_path].stream_id}) already exists. Skipping resume for stream {stream_id} to avoid conflict."
+        )
+        # This might indicate an issue with cleanup or multiple stream_ids pointing to the same file.
+        return
+
+    processor = StreamProcessor(
+        stream_id, file_path, s3_upload_id, s3_bucket, s3_key_prefix
+    )
+    try:
+        await processor._initialize_from_checkpoint()
+    except FileNotFoundError:
+        logger.error(
+            f"Failed to initialize processor for stream {stream_id} due to missing file: {file_path}. Stream already marked as failed by _initialize_from_checkpoint."
+        )
+        # _initialize_from_checkpoint should have already called add_stream_to_failed_set
+        return
+    except Exception as e_init:
+        logger.error(
+            f"Failed to initialize processor for stream {stream_id} from checkpoint: {e_init}",
+            exc_info=True,
+        )
+        await add_stream_to_failed_set(stream_id, "init_checkpoint_failed_on_resume")
+        return
+
+    active_processors[file_path] = processor  # Use Path object as key
+
+    if (
+        status == "pending_completion"
+        or status == "s3_completed"
+        or status == "failed_metadata_generation"
+        or status == "failed_metadata_upload"
+    ):
+        logger.info(
+            f"[{stream_id}] Resuming: stream status '{status}'. Triggering finalize_stream."
+        )
+        asyncio.create_task(
+            run_finalization_and_cleanup(processor, file_path),
+            name=f"resume_finalize_{stream_id[:8]}",
+        )
+    elif (
+        status == "active" or status == "processing" or status is None
+    ):  # 'processing' was old, 'active' is current
+        logger.info(
+            f"[{stream_id}] Resuming: stream status '{status or 'active/None'}'. Triggering process_file_write."
+        )
+        asyncio.create_task(
+            processor.process_file_write(), name=f"resume_write_{stream_id[:8]}"
+        )
+    else:  # e.g. "completed", "failed_s3_complete", "aborted_no_parts", "failed_finalization_meta", or specific failed_... from add_stream_to_failed_set
+        logger.info(
+            f"[{stream_id}] Resuming: stream has status '{status}'. No immediate action taken by resume_stream_processing. Stale checker or manual intervention might be needed if it's not a terminal state."
+        )
+
+
 async def main():
     logger.info("Application starting...")
     watch_dir_str = settings.watch_dir  # Use a local var for clarity
@@ -460,6 +549,33 @@ async def main():
 
     try:
         await get_redis_connection()  # Initialize Redis connection pool
+
+        logger.info("--- Attempting to resume interrupted streams ---")
+        active_ids_to_resume = await get_active_stream_ids()
+        pending_ids_to_resume = await get_pending_completion_stream_ids()
+
+        # Combine and remove duplicates. Note: A stream ID shouldn't be in both ideally.
+        all_ids_to_resume = set(active_ids_to_resume + pending_ids_to_resume)
+
+        if all_ids_to_resume:
+            logger.info(
+                f"Found {len(all_ids_to_resume)} unique stream IDs to potentially resume: {all_ids_to_resume}"
+            )
+            # Create tasks for each resume attempt
+            resume_tasks = [resume_stream_processing(sid) for sid in all_ids_to_resume]
+            # Wait for all resume attempts to complete (or fail)
+            results = await asyncio.gather(*resume_tasks, return_exceptions=True)
+            for sid, result in zip(all_ids_to_resume, results):
+                if isinstance(result, Exception):
+                    logger.error(
+                        f"Error during resume task for stream {sid}: {result}",
+                        exc_info=result,
+                    )
+        else:
+            logger.info(
+                "No interrupted streams found in 'active' or 'pending_completion' sets to resume."
+            )
+        logger.info("--- Resume attempt finished ---")
 
         logger.info("Starting periodic stale stream checker...")
         stale_check_task = asyncio.create_task(
