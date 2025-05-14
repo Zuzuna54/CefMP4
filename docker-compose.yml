@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    volumes:
+      - ./input-videos:/input-videos # Mount input directory
+      - ./src:/app/src # Mount src for development hot-reloading (optional for dev)
+    env_file:
+      - example.env # Load environment variables
+    ports:
+      - "${PROM_PORT:-8000}:${PROM_PORT:-8000}" # Expose Prometheus port
+    depends_on:
+      - minio
+      - redis
+    # command: ["python", "-m", "src.main"] # Can override Dockerfile CMD if needed
+
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # MinIO Console
+    volumes:
+      - minio-data:/data
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+    command: server /data --console-address ":9001"
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    # ports: # Uncomment to expose Redis for direct debugging
+    #   - "6379:6379"
+
+volumes:
+  minio-data:
+  redis-data:

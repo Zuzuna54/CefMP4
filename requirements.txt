@@ -1,0 +1,14 @@
+python-dotenv
+redis>=4.3.0,<5.0.0 # For redis.asyncio
+aioboto3
+watchdog
+pytest
+pytest-asyncio
+pydantic
+pydantic_settings
+watchfiles
+# Add other dependencies as identified, e.g., specific versions if necessary
+structlog # As planned for later phases, good to have for consistency if any stubs use it
+uvloop # Often used with asyncio for performance, optional but good practice
+# For ffprobe in later phases, but not a direct Python dep
+# ffmpeg-python (if we choose to use the python wrapper directly) 

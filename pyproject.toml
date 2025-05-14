@@ -1,0 +1,28 @@
+[project]
+name = "cefmp4_stream_processor"
+version = "0.1.0"
+description = "Monitors MP4 video streams, processes them in chunks, and uploads to S3."
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic-settings",
+    "python-dotenv",
+    "watchfiles",
+    "redis[hiredis] >= 4.0.0",
+    "aioboto3",
+    # Other core dependencies will be added in later phases
+]
+
+[tool.ruff]
+line-length = 88 # Example, can be adjusted
+select = ["E", "F", "W", "I", "UP", "C4", "B"] # Common useful rules
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true # Initially, can be stricter later
+# Add paths if needed, e.g., mypy_path = "src" 
