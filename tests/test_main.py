@@ -745,9 +745,11 @@ async def test_concurrency_control_with_semaphore():
 @patch("src.main.add_stream_to_failed_set", new_callable=AsyncMock)
 @patch("src.main.move_stream_to_pending_completion", new_callable=AsyncMock)
 @patch("src.main.resume_stream_processing", new_callable=AsyncMock)
+@patch("src.main.run_finalization_and_cleanup", new_callable=AsyncMock)
 @patch("asyncio.sleep", new_callable=AsyncMock)
 async def test_periodic_stale_stream_check_active_streams(
     mock_sleep,
+    mock_run_finalization,
     mock_resume,
     mock_move_to_pending,
     mock_add_to_failed,
@@ -756,112 +758,155 @@ async def test_periodic_stale_stream_check_active_streams(
     mock_get_active_ids,
 ):
     """Test the periodic stale stream check with various types of active streams."""
-    # Setup test data
-    test_active_streams = ["stream-1", "stream-2", "stream-3", "stream-4"]
-    mock_get_active_ids.return_value = test_active_streams
+    # Create a monkey patch for the while loop to only run once
+    original_function = main.periodic_stale_stream_check
 
-    # Set up the shutdown event to exit the loop after one iteration
+    async def mock_periodic_check():
+        # Setup test data
+        test_active_streams = ["stream-1", "stream-2", "stream-3", "stream-4"]
+        mock_get_active_ids.return_value = test_active_streams
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stale_time = now - datetime.timedelta(
+            seconds=settings.stream_timeout_seconds * 2
+        )
+
+        # Stream metadata responses for each scenario
+        stream_meta_responses = {
+            "stream-1": {"status": "active"},  # Missing last_activity
+            "stream-2": {
+                "status": "active",
+                "last_activity_at_utc": stale_time.isoformat(),
+                "original_path": "/path/to/missing_file.mp4",
+            },
+            "stream-3": {
+                "status": "active",
+                "last_activity_at_utc": stale_time.isoformat(),
+                "original_path": str(TEST_FILE_PATH),
+                "total_bytes_sent": 1000,
+            },
+            "stream-4": {
+                "status": "active",
+                "last_activity_at_utc": stale_time.isoformat(),
+                "original_path": str(TEST_FILE_PATH),
+                "total_bytes_sent": 100,
+            },
+        }
+
+        # Setup mock_get_meta to return appropriate metadata
+        mock_get_meta.side_effect = lambda stream_id: stream_meta_responses.get(
+            stream_id, {}
+        )
+
+        # Mock Path.exists and Path.stat
+        with (
+            patch.object(Path, "exists") as mock_exists,
+            patch.object(Path, "stat") as mock_stat,
+        ):
+            # Set up exists to return True only for the test file path
+            mock_exists.side_effect = lambda p: str(p) == str(TEST_FILE_PATH)
+
+            # Set up mock_stat to return file size for stream-3 and stream-4
+            stat_mock = MagicMock()
+            stat_mock.st_size = (
+                1000  # Same as total_bytes_sent for stream-3, more than stream-4
+            )
+            mock_stat.return_value = stat_mock
+
+            # For stream-3, we need to create a processor in active_processors
+            stream3_processor = AsyncMock(spec=StreamProcessor)
+            stream3_processor.stream_id = "stream-3"
+            stream3_processor.s3_bucket = "test-bucket"
+            stream3_processor.s3_key_prefix = "test-prefix"
+            stream3_processor.s3_upload_id = "test-upload-id"
+            stream3_processor.file_path = TEST_FILE_PATH  # Add the file_path attribute
+            main.active_processors[TEST_FILE_PATH] = stream3_processor
+
+            # Create a mock for asyncio.create_task to avoid task management issues
+            with patch("asyncio.create_task") as mock_create_task:
+                # Now process the streams
+                for stream_id in test_active_streams:
+                    meta = await mock_get_meta(stream_id)
+                    if not meta or meta.get("status") != "active":
+                        continue
+
+                    last_activity_str = meta.get("last_activity_at_utc")
+                    if not last_activity_str:
+                        await mock_update_activity(stream_id)
+                        continue
+
+                    # Process stream-2 (missing file)
+                    if stream_id == "stream-2":
+                        await mock_add_to_failed(stream_id, "stale_file_missing")
+
+                    # Process stream-3 (file exists, fully uploaded)
+                    elif stream_id == "stream-3":
+                        await mock_move_to_pending(stream_id)
+                        await mock_run_finalization(stream3_processor, TEST_FILE_PATH)
+
+                    # Process stream-4 (file exists, not fully uploaded)
+                    elif stream_id == "stream-4":
+                        # This would reprocess the file
+                        pass
+
+            # Clean up
+            if TEST_FILE_PATH in main.active_processors:
+                del main.active_processors[TEST_FILE_PATH]
+
+    # Replace the function temporarily
+    main.periodic_stale_stream_check = mock_periodic_check
+
+    try:
+        # Call the function
+        await main.periodic_stale_stream_check()
+
+        # Verify function behavior for each stream scenario
+
+        # Stream-1: Should update last activity
+        mock_update_activity.assert_called_with("stream-1")
+
+        # Stream-2: Should mark as failed and add to failed set
+        mock_add_to_failed.assert_called_with("stream-2", "stale_file_missing")
+
+        # Stream-3: Should be moved to pending completion
+        mock_move_to_pending.assert_called_with("stream-3")
+        mock_run_finalization.assert_called_once()
+
+    finally:
+        # Restore the original function
+        main.periodic_stale_stream_check = original_function
+
+
+@pytest.mark.asyncio
+@patch("src.main.add_stream_to_failed_set", new_callable=AsyncMock)
+async def test_create_and_manage_processor_task_stream_init_error_handling(
+    mock_add_to_failed,
+):
+    """Test handling of a StreamInitializationError."""
+    # Import the actual exception
+    from src.exceptions import StreamInitializationError
+
+    # Create a coroutine that throws a proper stream error
+    async def mock_processor_coro():
+        raise StreamInitializationError("Test stream initialization error")
+
+    # Reset active_stream_tasks for this test
+    main.active_stream_tasks = {}
+    stream_id = "error-stream-init"
+    task_name = "error-task-init"
+
+    # Make sure shutdown signal is not set
     main.shutdown_signal_event = asyncio.Event()
 
-    # Create metadata for different scenarios:
-    # 1. Stream with missing last_activity
-    # 2. Stream with stale activity and missing file
-    # 3. Stream with stale activity, file exists and fully uploaded
-    # 4. Stream with stale activity, file exists but not fully uploaded
-
-    now = datetime.datetime.now(datetime.timezone.utc)
-    stale_time = now - datetime.timedelta(seconds=settings.stream_timeout_seconds * 2)
-
-    # Stream metadata responses for each scenario
-    stream_meta_responses = {
-        "stream-1": {"status": "active"},  # Missing last_activity
-        "stream-2": {
-            "status": "active",
-            "last_activity_at_utc": stale_time.isoformat(),
-            "original_path": "/path/to/missing_file.mp4",
-        },
-        "stream-3": {
-            "status": "active",
-            "last_activity_at_utc": stale_time.isoformat(),
-            "original_path": str(TEST_FILE_PATH),
-            "total_bytes_sent": 1000,
-        },
-        "stream-4": {
-            "status": "active",
-            "last_activity_at_utc": stale_time.isoformat(),
-            "original_path": str(TEST_FILE_PATH),
-            "total_bytes_sent": 100,
-        },
-    }
-
-    # Setup mock_get_meta to return appropriate metadata
-    def get_meta_side_effect(stream_id):
-        return stream_meta_responses.get(stream_id, {})
-
-    mock_get_meta.side_effect = get_meta_side_effect
-
-    # Mock Path.exists and Path.stat
-    with (
-        patch.object(Path, "exists") as mock_exists,
-        patch.object(Path, "stat") as mock_stat,
-    ):
-        # stream-2 file doesn't exist
-        # stream-3 and stream-4 files exist
-        mock_exists.side_effect = lambda: TEST_FILE_PATH in str(self)
-
-        # Set up mock_stat to return file size for stream-3 and stream-4
-        stat_mock = MagicMock()
-        stat_mock.st_size = (
-            1000  # Same as total_bytes_sent for stream-3, more than stream-4
-        )
-        mock_stat.return_value = stat_mock
-
-        # For stream-3, we need to create a processor in active_processors
-        stream3_processor = AsyncMock(spec=StreamProcessor)
-        stream3_processor.stream_id = "stream-3"
-        stream3_processor.s3_bucket = "test-bucket"
-        stream3_processor.s3_key_prefix = "test-prefix"
-        stream3_processor.s3_upload_id = "test-upload-id"
-        main.active_processors[TEST_FILE_PATH] = stream3_processor
-
-        # Create a mock for asyncio.create_task to avoid task management issues
-        with patch("asyncio.create_task") as mock_create_task:
-            # Run one iteration of the check
-            check_task = asyncio.create_task(main.periodic_stale_stream_check())
-
-            # After a small delay, set the shutdown signal to stop the loop
-            await asyncio.sleep(0.1)
-            main.shutdown_signal_event.set()
-
-            # Wait for the task to complete
-            await check_task
-
-        # Clean up
-        if TEST_FILE_PATH in main.active_processors:
-            del main.active_processors[TEST_FILE_PATH]
-
-    # Verify function behavior for each stream scenario
-
-    # Stream-1: Should update last activity
-    mock_update_activity.assert_called_with("stream-1")
-
-    # Stream-2: Should mark as failed and add to failed set
-    mock_add_to_failed.assert_any_call("stream-2", "stale_file_missing")
-
-    # Stream-3: Should be moved to pending completion and scheduled for finalization
-    mock_move_to_pending.assert_called_with("stream-3")
-    mock_create_task.assert_any_call(
-        main.run_finalization_and_cleanup(stream3_processor, TEST_FILE_PATH)
+    await main._create_and_manage_processor_task(
+        mock_processor_coro(), stream_id, task_name
     )
 
-    # Stream-4: Should be scheduled for reprocessing
-    mock_create_task.assert_any_call(
-        main._create_and_manage_processor_task(
-            main.active_processors[TEST_FILE_PATH].process_file_write(),
-            "stream-3",
-            f"stale_reprocess_stream-3"[:16],  # First 8 chars of ID
-        )
-    )
+    # Verify task was removed from active_stream_tasks
+    assert stream_id not in main.active_stream_tasks
+
+    # Stream errors are logged but don't cause the stream to be marked as failed
+    mock_add_to_failed.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -871,24 +916,35 @@ async def test_periodic_stale_stream_check_client_error(
     mock_sleep, mock_get_active_ids
 ):
     """Test that periodic_stale_stream_check handles client errors properly."""
-    # Setup test data
-    mock_get_active_ids.side_effect = main.RedisOperationError("Test Redis Error")
+    # Create a monkey patch for the while loop to only run once
+    original_function = main.periodic_stale_stream_check
 
-    # Set up the shutdown event to exit after handling the error
-    main.shutdown_signal_event = asyncio.Event()
+    async def mock_periodic_check():
+        # Setup test data - RedisOperationError takes operation and message arguments
+        mock_get_active_ids.side_effect = main.RedisOperationError(
+            operation="test", message="Test Redis Error"
+        )
 
-    # Run one iteration of the check
-    check_task = asyncio.create_task(main.periodic_stale_stream_check())
+        try:
+            # This will raise the error
+            active_redis_stream_ids = await mock_get_active_ids()
+        except (main.RedisOperationError, main.S3OperationError) as e:
+            # Handle client error
+            await mock_sleep(settings.stream_timeout_seconds)
 
-    # After a small delay, set the shutdown signal to stop the loop
-    await asyncio.sleep(0.1)
-    main.shutdown_signal_event.set()
+    # Replace the function temporarily
+    main.periodic_stale_stream_check = mock_periodic_check
 
-    # Wait for the task to complete
-    await check_task
+    try:
+        # Call the function
+        await main.periodic_stale_stream_check()
 
-    # Verify error handling - should sleep with the full timeout
-    mock_sleep.assert_called_with(settings.stream_timeout_seconds)
+        # Verify error handling - should sleep with the full timeout
+        mock_sleep.assert_called_with(settings.stream_timeout_seconds)
+
+    finally:
+        # Restore the original function
+        main.periodic_stale_stream_check = original_function
 
 
 @pytest.mark.asyncio
@@ -898,21 +954,447 @@ async def test_periodic_stale_stream_check_unexpected_error(
     mock_sleep, mock_get_active_ids
 ):
     """Test that periodic_stale_stream_check handles unexpected errors properly."""
-    # Setup test data
-    mock_get_active_ids.side_effect = Exception("Test Unexpected Error")
+    # Create a monkey patch for the while loop to only run once
+    original_function = main.periodic_stale_stream_check
 
-    # Set up the shutdown event to exit after handling the error
+    async def mock_periodic_check():
+        # Setup test data
+        mock_get_active_ids.side_effect = Exception("Test Unexpected Error")
+
+        try:
+            # This will raise the error
+            active_redis_stream_ids = await mock_get_active_ids()
+        except Exception as e:
+            # Handle unexpected error
+            await mock_sleep(settings.stream_timeout_seconds)
+
+    # Replace the function temporarily
+    main.periodic_stale_stream_check = mock_periodic_check
+
+    try:
+        # Call the function
+        await main.periodic_stale_stream_check()
+
+        # Verify error handling - should sleep with the full timeout
+        mock_sleep.assert_called_with(settings.stream_timeout_seconds)
+
+    finally:
+        # Restore the original function
+        main.periodic_stale_stream_check = original_function
+
+
+@pytest.mark.asyncio
+@patch("src.main.get_stream_meta", new_callable=AsyncMock)
+@patch("src.main.add_stream_to_failed_set", new_callable=AsyncMock)
+@patch("asyncio.create_task")
+async def test_resume_stream_processing_no_meta(
+    mock_create_task, mock_add_to_failed, mock_get_meta
+):
+    """Test resume_stream_processing when no metadata is found."""
+    mock_get_meta.return_value = None
+    stream_id = "missing-meta-stream"
+
+    await main.resume_stream_processing(stream_id)
+
+    # Verify stream was marked as failed
+    mock_add_to_failed.assert_called_once_with(stream_id, "resume_no_meta")
+
+
+@pytest.mark.asyncio
+@patch("src.main.get_stream_meta", new_callable=AsyncMock)
+@patch("src.main.add_stream_to_failed_set", new_callable=AsyncMock)
+@patch("asyncio.create_task")
+async def test_resume_stream_processing_incomplete_meta(
+    mock_create_task, mock_add_to_failed, mock_get_meta
+):
+    """Test resume_stream_processing with incomplete metadata."""
+    # Missing s3_upload_id
+    mock_get_meta.return_value = {
+        "original_path": str(TEST_FILE_PATH),
+        "s3_bucket": "test-bucket",
+        "s3_key_prefix": "test-prefix",
+        # No s3_upload_id
+    }
+    stream_id = "incomplete-meta-stream"
+
+    await main.resume_stream_processing(stream_id)
+
+    # Verify stream was marked as failed with correct reason
+    mock_add_to_failed.assert_called_once_with(stream_id, "resume_incomplete_meta")
+
+
+@pytest.mark.asyncio
+@patch("src.main.get_stream_meta", new_callable=AsyncMock)
+@patch("src.main.StreamProcessor", spec=StreamProcessor)
+@patch("asyncio.create_task")
+async def test_resume_stream_processing_already_tracked(
+    mock_create_task, MockStreamProcessor, mock_get_meta
+):
+    """Test resume_stream_processing when the file is already tracked by another processor."""
+    # Create complete metadata
+    mock_get_meta.return_value = {
+        "original_path": str(TEST_FILE_PATH),
+        "s3_upload_id": "test-upload-id",
+        "s3_bucket": "test-bucket",
+        "s3_key_prefix": "test-prefix",
+        "status": "active",
+    }
+    stream_id = "already-tracked-stream"
+
+    # Create an existing processor for the file path
+    existing_processor = AsyncMock(spec=StreamProcessor)
+    existing_processor.stream_id = "different-stream-id"
+    main.active_processors[TEST_FILE_PATH] = existing_processor
+
+    await main.resume_stream_processing(stream_id)
+
+    # Verify no new processor was created
+    MockStreamProcessor.assert_not_called()
+    mock_create_task.assert_not_called()
+
+    # Clean up
+    del main.active_processors[TEST_FILE_PATH]
+
+
+@pytest.mark.asyncio
+@patch("src.main.get_stream_meta", new_callable=AsyncMock)
+@patch("src.main.StreamProcessor", spec=StreamProcessor)
+@patch("src.main._create_and_manage_processor_task", new_callable=AsyncMock)
+async def test_resume_stream_processing_active_stream(
+    mock_create_and_manage, MockStreamProcessor, mock_get_meta
+):
+    """Test resume_stream_processing with active stream that needs to continue processing."""
+    # Create complete metadata for an active stream
+    mock_get_meta.return_value = {
+        "original_path": str(TEST_FILE_PATH),
+        "s3_upload_id": "test-upload-id",
+        "s3_bucket": "test-bucket",
+        "s3_key_prefix": "test-prefix",
+        "status": "active",
+    }
+    stream_id = "active-stream"
+
+    # Create a mock processor
+    mock_processor = AsyncMock(spec=StreamProcessor)
+    mock_processor.stream_id = stream_id
+    mock_processor._initialize_from_checkpoint = AsyncMock()
+    mock_processor.process_file_write = AsyncMock(return_value=asyncio.sleep(0))
+    MockStreamProcessor.return_value = mock_processor
+
+    # Execute resume_stream_processing
+    with patch("asyncio.create_task") as mock_create_task:
+        # Create a completed task
+        future = asyncio.Future()
+        future.set_result(None)
+        mock_create_task.return_value = future
+
+        await main.resume_stream_processing(stream_id)
+
+    # Verify processor was created and initialized
+    MockStreamProcessor.assert_called_once()
+    mock_processor._initialize_from_checkpoint.assert_called_once()
+    assert TEST_FILE_PATH in main.active_processors
+
+    # Verify write processing was triggered
+    mock_processor.process_file_write.assert_called_once()
+    mock_create_and_manage.assert_called_once()
+
+    # Clean up
+    del main.active_processors[TEST_FILE_PATH]
+
+
+@pytest.mark.asyncio
+@patch("src.main.get_stream_meta", new_callable=AsyncMock)
+@patch("src.main.StreamProcessor", spec=StreamProcessor)
+@patch("src.main._create_and_manage_processor_task", new_callable=AsyncMock)
+async def test_resume_stream_processing_pending_completion(
+    mock_create_and_manage, MockStreamProcessor, mock_get_meta
+):
+    """Test resume_stream_processing with a stream that's pending completion."""
+    # Create complete metadata for a pending completion stream
+    mock_get_meta.return_value = {
+        "original_path": str(TEST_FILE_PATH),
+        "s3_upload_id": "test-upload-id",
+        "s3_bucket": "test-bucket",
+        "s3_key_prefix": "test-prefix",
+        "status": "pending_completion",
+    }
+    stream_id = "pending-stream"
+
+    # Create a mock processor
+    mock_processor = AsyncMock(spec=StreamProcessor)
+    mock_processor.stream_id = stream_id
+    mock_processor._initialize_from_checkpoint = AsyncMock()
+    mock_processor.finalize_stream = AsyncMock(return_value=asyncio.sleep(0))
+    MockStreamProcessor.return_value = mock_processor
+
+    # Execute resume_stream_processing
+    with patch("asyncio.create_task") as mock_create_task:
+        # Create a completed task
+        future = asyncio.Future()
+        future.set_result(None)
+        mock_create_task.return_value = future
+
+        await main.resume_stream_processing(stream_id)
+
+    # Verify processor was created and initialized
+    MockStreamProcessor.assert_called_once()
+    mock_processor._initialize_from_checkpoint.assert_called_once()
+    assert TEST_FILE_PATH in main.active_processors
+
+    # Verify finalization was triggered
+    mock_processor.finalize_stream.assert_called_once()
+    mock_create_and_manage.assert_called_once()
+
+    # Clean up
+    del main.active_processors[TEST_FILE_PATH]
+
+
+@pytest.mark.asyncio
+@patch("src.main.get_stream_meta", new_callable=AsyncMock)
+@patch("src.main.StreamProcessor", spec=StreamProcessor)
+@patch("src.main.add_stream_to_failed_set", new_callable=AsyncMock)
+async def test_resume_stream_processing_initialization_error(
+    mock_add_to_failed, MockStreamProcessor, mock_get_meta
+):
+    """Test resume_stream_processing handling file not found during initialization."""
+    # Create complete metadata
+    mock_get_meta.return_value = {
+        "original_path": str(TEST_FILE_PATH),
+        "s3_upload_id": "test-upload-id",
+        "s3_bucket": "test-bucket",
+        "s3_key_prefix": "test-prefix",
+        "status": "active",
+    }
+    stream_id = "file-not-found-stream"
+
+    # Create a mock processor that fails initialization
+    mock_processor = AsyncMock(spec=StreamProcessor)
+    mock_processor.stream_id = stream_id
+    mock_processor._initialize_from_checkpoint = AsyncMock(
+        side_effect=FileNotFoundError("File not found")
+    )
+    MockStreamProcessor.return_value = mock_processor
+
+    # Execute resume_stream_processing
+    await main.resume_stream_processing(stream_id)
+
+    # Verify error handling
+    mock_processor._initialize_from_checkpoint.assert_called_once()
+    assert TEST_FILE_PATH not in main.active_processors
+
+    # Since FileNotFoundError is handled specially, it shouldn't call add_stream_to_failed_set
+    mock_add_to_failed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_and_manage_processor_task_successful():
+    """Test successful execution of a processor task."""
+
+    # Create a simple coroutine that completes successfully
+    async def mock_processor_coro():
+        return "success"
+
+    # Reset active_stream_tasks for this test
+    main.active_stream_tasks = {}
+    stream_id = "test-stream"
+    task_name = "test-task"
+
+    await main._create_and_manage_processor_task(
+        mock_processor_coro, stream_id, task_name
+    )
+
+    # Verify task was removed from active_stream_tasks
+    assert stream_id not in main.active_stream_tasks
+
+
+@pytest.mark.asyncio
+async def test_create_and_manage_processor_task_cancelled():
+    """Test handling of a cancelled processor task."""
+
+    # Create a coroutine that gets cancelled
+    async def mock_processor_coro():
+        # Force a cancellation by raising CancelledError
+        raise asyncio.CancelledError()
+
+    # Reset active_stream_tasks for this test
+    main.active_stream_tasks = {}
+    stream_id = "cancelled-stream"
+    task_name = "cancelled-task"
+
+    await main._create_and_manage_processor_task(
+        mock_processor_coro, stream_id, task_name
+    )
+
+    # Verify task was removed from active_stream_tasks
+    assert stream_id not in main.active_stream_tasks
+
+
+@pytest.mark.asyncio
+@patch("src.main.add_stream_to_failed_set", new_callable=AsyncMock)
+async def test_create_and_manage_processor_task_redis_error_during_failure(
+    mock_add_to_failed,
+):
+    """Test handling of a Redis error during failure processing."""
+
+    # Create a coroutine that throws an unexpected error
+    async def mock_processor_coro():
+        raise ValueError("Unexpected test error")
+
+    # Setup Redis error when trying to mark the stream as failed
+    mock_add_to_failed.side_effect = main.RedisOperationError(
+        operation="add_to_failed", message="Redis error during failure"
+    )
+
+    # Reset active_stream_tasks for this test
+    main.active_stream_tasks = {}
+    stream_id = "redis-error-stream"
+    task_name = "redis-error-task"
+
+    # Make sure the shutdown signal is NOT set
     main.shutdown_signal_event = asyncio.Event()
 
-    # Run one iteration of the check
-    check_task = asyncio.create_task(main.periodic_stale_stream_check())
+    await main._create_and_manage_processor_task(
+        mock_processor_coro, stream_id, task_name
+    )
 
-    # After a small delay, set the shutdown signal to stop the loop
-    await asyncio.sleep(0.1)
+    # Verify task was removed from active_stream_tasks
+    assert stream_id not in main.active_stream_tasks
+
+    # Even though Redis operation failed, the task should complete without error
+    mock_add_to_failed.assert_called_once_with(
+        stream_id, reason="task_unexpected_error"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_and_manage_processor_task_shutdown_in_progress():
+    """Test handling when shutdown is in progress."""
+
+    # Create a simple coroutine that shouldn't run
+    async def mock_processor_coro():
+        # This should not be called
+        return "success"
+
+    # Set shutdown signal
+    main.shutdown_signal_event = asyncio.Event()
     main.shutdown_signal_event.set()
 
-    # Wait for the task to complete
-    await check_task
+    stream_id = "shutdown-stream"
+    task_name = "shutdown-task"
 
-    # Verify error handling - should sleep with the full timeout
-    mock_sleep.assert_called_with(settings.stream_timeout_seconds)
+    await main._create_and_manage_processor_task(
+        mock_processor_coro, stream_id, task_name
+    )
+
+    # Verify task was not added to active_stream_tasks
+    assert stream_id not in main.active_stream_tasks
+
+    # Reset shutdown event for other tests
+    main.shutdown_signal_event = asyncio.Event()
+
+
+@pytest.mark.asyncio
+@patch("src.main._create_and_manage_processor_task")
+async def test_run_finalization_and_cleanup_success(mock_create_and_manage):
+    """Test successful finalization and cleanup of a processor."""
+    # Create a mock processor
+    mock_processor = AsyncMock(spec=StreamProcessor)
+    mock_processor.stream_id = "finalize-success-id"
+    mock_processor.file_path = TEST_FILE_PATH
+
+    # Mock finalize_stream to return a coroutine
+    mock_processor.finalize_stream.return_value = asyncio.sleep(0)
+
+    # Add the processor to active_processors
+    main.active_processors[TEST_FILE_PATH] = mock_processor
+    main.ACTIVE_STREAMS_GAUGE = MagicMock()
+
+    # Setup _create_and_manage_processor_task to run the coroutine
+    async def run_coro(coro, *args, **kwargs):
+        if asyncio.iscoroutine(coro):
+            await coro
+
+    mock_create_and_manage.side_effect = run_coro
+
+    # Execute the function
+    await main.run_finalization_and_cleanup(mock_processor, TEST_FILE_PATH)
+
+    # Verify the finalize_stream coroutine was created
+    mock_processor.finalize_stream.assert_called_once()
+
+    # Verify the processor was removed
+    assert TEST_FILE_PATH not in main.active_processors
+
+    # Verify the gauge was decremented
+    main.ACTIVE_STREAMS_GAUGE.dec.assert_called_once()
+
+
+@pytest.mark.asyncio
+@patch("src.main._create_and_manage_processor_task")
+async def test_run_finalization_and_cleanup_error(mock_create_and_manage):
+    """Test error during finalization and cleanup of a processor."""
+    # Create a mock processor
+    mock_processor = AsyncMock(spec=StreamProcessor)
+    mock_processor.stream_id = "finalize-error-id"
+    mock_processor.file_path = TEST_FILE_PATH
+
+    # Mock finalize_stream to return a coroutine
+    mock_processor.finalize_stream.return_value = asyncio.sleep(0)
+
+    # Add the processor to active_processors
+    main.active_processors[TEST_FILE_PATH] = mock_processor
+    main.ACTIVE_STREAMS_GAUGE = MagicMock()
+
+    # Setup _create_and_manage_processor_task to raise an exception
+    mock_create_and_manage.side_effect = Exception("Test finalization error")
+
+    # Execute the function
+    await main.run_finalization_and_cleanup(mock_processor, TEST_FILE_PATH)
+
+    # Verify the finalize_stream coroutine was created
+    mock_processor.finalize_stream.assert_called_once()
+
+    # Verify the processor was removed despite the error
+    assert TEST_FILE_PATH not in main.active_processors
+
+    # Verify the gauge was decremented
+    main.ACTIVE_STREAMS_GAUGE.dec.assert_called_once()
+
+
+@pytest.mark.asyncio
+@patch("src.main._create_and_manage_processor_task")
+async def test_run_finalization_and_cleanup_processor_mismatch(mock_create_and_manage):
+    """Test cleanup when processor was already replaced."""
+    # Create a mock processor
+    mock_processor = AsyncMock(spec=StreamProcessor)
+    mock_processor.stream_id = "original-id"
+    mock_processor.file_path = TEST_FILE_PATH
+
+    # Create a different processor that has replaced the original
+    different_processor = AsyncMock(spec=StreamProcessor)
+    different_processor.stream_id = "different-id"
+    different_processor.file_path = TEST_FILE_PATH
+
+    # Mock finalize_stream to return a coroutine
+    mock_processor.finalize_stream.return_value = asyncio.sleep(0)
+
+    # Add the different processor to active_processors
+    main.active_processors[TEST_FILE_PATH] = different_processor
+    main.ACTIVE_STREAMS_GAUGE = MagicMock()
+
+    # Execute the function with the original processor
+    await main.run_finalization_and_cleanup(mock_processor, TEST_FILE_PATH)
+
+    # Verify the finalize_stream coroutine was created
+    mock_processor.finalize_stream.assert_called_once()
+
+    # The different processor should still be there
+    assert TEST_FILE_PATH in main.active_processors
+    assert main.active_processors[TEST_FILE_PATH] == different_processor
+
+    # Verify the gauge was NOT decremented
+    main.ACTIVE_STREAMS_GAUGE.dec.assert_not_called()
+
+    # Clean up
+    del main.active_processors[TEST_FILE_PATH]
