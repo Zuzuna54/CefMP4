@@ -8,7 +8,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg dumb-ini
 
 # Copy project files
 COPY pyproject.toml ./
-# In later phases, we'll copy requirements.txt after generating it
+COPY requirements.txt ./
+# Install dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
 COPY src /app/src
 
 # Create a non-root user and switch to it (good practice)
@@ -24,5 +28,5 @@ EXPOSE ${PROM_PORT}
 # Ensure the user has permissions to write to any necessary directories if not running as root
 # USER appuser # Example if a non-root user is setup
 
-ENTRYPOINT ["python", "-m", "src.main"]
+ENTRYPOINT ["dumb-init", "--", "python", "-m", "src.main"]
 # CMD is not strictly needed if ENTRYPOINT is a list like above and main.py handles all logic 

@@ -21,14 +21,14 @@ class Settings(BaseSettings):
         30  # Time to wait for more file writes before considering a stream IDLE or STALE
     )
 
-    s3_endpoint_url: str | None = None  # For MinIO, e.g., "http://localhost:9000"
+    s3_endpoint_url: str | None = "http://minio:9000"  # For MinIO in Docker
     s3_access_key_id: str = "MINIO_ACCESS_KEY"  # Default for local MinIO
     s3_secret_access_key: str = "MINIO_SECRET_KEY"  # Default for local MinIO
     s3_bucket_name: str = "video-streams"
     s3_region_name: str = "us-east-1"  # Default, can be anything for MinIO
     s3_default_content_type: str = "application/octet-stream"
 
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = "redis://redis:6379/0"
 
     ffprobe_path: str | None = None  # Path to ffprobe executable if not in PATH
 

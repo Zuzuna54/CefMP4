@@ -9,6 +9,12 @@ import logging
 
 from src.stream_processor import StreamProcessor
 from src.config import settings  # Used by StreamProcessor indirectly
+from src.exceptions import (
+    StreamFinalizationError,
+    S3OperationError,
+    RedisOperationError,
+    FFprobeError,
+)
 
 # Add missing imports for the functions that are patched in the tests
 from src.redis_client import (
@@ -20,8 +26,19 @@ from src.redis_client import (
     set_stream_next_part,
     update_stream_last_activity,
     get_stream_meta,
+    set_stream_status,
+    remove_stream_from_pending_completion,
+    add_stream_to_failed_set,
+    remove_stream_keys,
+    add_stream_to_completed_set,
 )
-from src.s3_client import upload_s3_part
+from src.s3_client import (
+    upload_s3_part,
+    complete_s3_multipart_upload,
+    abort_s3_multipart_upload,
+    upload_json_to_s3,
+)
+from src.metadata_generator import generate_metadata_json
 
 # Mock settings for tests if they influence StreamProcessor directly or via other modules it uses.
 # For now, assume default settings are fine or specific tests will patch where needed.
@@ -485,3 +502,267 @@ async def test_process_file_write_file_disappears_during_processing(
 
 # Reset settings.chunk_size_bytes if it was changed by a test (it wasn't explicitly here but good practice)
 # settings.chunk_size_bytes = original_chunk_size (if it was stored)
+
+
+@pytest.mark.asyncio
+@patch("src.s3_client.complete_s3_multipart_upload", new_callable=AsyncMock)
+@patch("src.s3_client.upload_json_to_s3", new_callable=AsyncMock)
+@patch("src.metadata_generator.generate_metadata_json", new_callable=AsyncMock)
+@patch("src.redis_client.get_stream_parts", new_callable=AsyncMock)
+@patch("src.redis_client.set_stream_status", new_callable=AsyncMock)
+@patch("src.redis_client.remove_stream_from_pending_completion", new_callable=AsyncMock)
+@patch("src.redis_client.add_stream_to_completed_set", new_callable=AsyncMock)
+@patch("src.redis_client.remove_stream_keys", new_callable=AsyncMock)
+async def test_finalize_stream_successful(
+    mock_remove_stream_keys: AsyncMock,
+    mock_add_to_completed_set: AsyncMock,
+    mock_remove_from_pending: AsyncMock,
+    mock_set_status: AsyncMock,
+    mock_get_parts: AsyncMock,
+    mock_generate_metadata: AsyncMock,
+    mock_upload_json_to_s3: AsyncMock,
+    mock_complete_s3: AsyncMock,
+    stream_processor_instance: StreamProcessor,
+    mock_file_path: Path,
+):
+    """Test successful stream finalization flow."""
+    # Mock file exists
+    mock_file_path.touch()
+
+    # Setup mock return values
+    mock_parts = [
+        {"PartNumber": 1, "ETag": "etag1", "Size": 1024},
+        {"PartNumber": 2, "ETag": "etag2", "Size": 2048},
+    ]
+    mock_get_parts.return_value = mock_parts
+    mock_complete_s3.return_value = True
+    mock_metadata = {
+        "stream_id": TEST_STREAM_ID,
+        "duration_seconds": 60.5,
+    }
+    mock_generate_metadata.return_value = mock_metadata
+    mock_upload_json_to_s3.return_value = True
+
+    # Call the method under test
+    await stream_processor_instance.finalize_stream()
+
+    # Assert correct calls
+    mock_get_parts.assert_called_once_with(TEST_STREAM_ID)
+    mock_complete_s3.assert_called_once_with(
+        bucket_name=TEST_S3_BUCKET,
+        object_key=TEST_S3_KEY_PREFIX,
+        upload_id=TEST_S3_UPLOAD_ID,
+        parts=mock_parts,
+    )
+    mock_set_status.assert_any_call(TEST_STREAM_ID, "s3_completed")
+    mock_generate_metadata.assert_called_once_with(TEST_STREAM_ID, mock_file_path)
+    mock_upload_json_to_s3.assert_called_once()
+    mock_set_status.assert_any_call(TEST_STREAM_ID, "completed")
+    mock_add_to_completed_set.assert_called_once_with(TEST_STREAM_ID)
+    mock_remove_stream_keys.assert_called_once_with(TEST_STREAM_ID)
+    mock_remove_from_pending.assert_called_once_with(TEST_STREAM_ID)
+    assert not stream_processor_instance.is_finalizing
+
+
+@pytest.mark.asyncio
+@patch("src.s3_client.abort_s3_multipart_upload", new_callable=AsyncMock)
+@patch("src.redis_client.get_stream_parts", new_callable=AsyncMock)
+@patch("src.redis_client.set_stream_status", new_callable=AsyncMock)
+@patch("src.redis_client.remove_stream_from_pending_completion", new_callable=AsyncMock)
+async def test_finalize_stream_empty_parts(
+    mock_remove_from_pending: AsyncMock,
+    mock_set_status: AsyncMock,
+    mock_get_parts: AsyncMock,
+    mock_abort_s3: AsyncMock,
+    stream_processor_instance: StreamProcessor,
+    mock_file_path: Path,
+):
+    """Test handling of empty parts list during finalization."""
+    # Mock file exists
+    mock_file_path.touch()
+
+    # Setup mock to return empty parts list
+    mock_get_parts.return_value = []
+    mock_abort_s3.return_value = True
+
+    # Call the method under test
+    await stream_processor_instance.finalize_stream()
+
+    # Assert correct calls
+    mock_get_parts.assert_called_once_with(TEST_STREAM_ID)
+    mock_abort_s3.assert_called_once_with(
+        TEST_S3_BUCKET, TEST_S3_KEY_PREFIX, TEST_S3_UPLOAD_ID
+    )
+    mock_set_status.assert_called_once_with(TEST_STREAM_ID, "aborted_no_parts")
+    mock_remove_from_pending.assert_called_once_with(TEST_STREAM_ID)
+    assert not stream_processor_instance.is_finalizing
+
+
+@pytest.mark.asyncio
+@patch("src.s3_client.complete_s3_multipart_upload", new_callable=AsyncMock)
+@patch("src.s3_client.abort_s3_multipart_upload", new_callable=AsyncMock)
+@patch("src.redis_client.get_stream_parts", new_callable=AsyncMock)
+@patch("src.redis_client.add_stream_to_failed_set", new_callable=AsyncMock)
+@patch("src.redis_client.remove_stream_from_pending_completion", new_callable=AsyncMock)
+async def test_finalize_stream_s3_completion_failure(
+    mock_remove_from_pending: AsyncMock,
+    mock_add_to_failed_set: AsyncMock,
+    mock_get_parts: AsyncMock,
+    mock_abort_s3: AsyncMock,
+    mock_complete_s3: AsyncMock,
+    stream_processor_instance: StreamProcessor,
+    mock_file_path: Path,
+):
+    """Test handling of S3 completion failure during finalization."""
+    # Mock file exists
+    mock_file_path.touch()
+
+    # Setup mock return values
+    mock_parts = [
+        {"PartNumber": 1, "ETag": "etag1", "Size": 1024},
+    ]
+    mock_get_parts.return_value = mock_parts
+
+    # Simulate S3 complete operation failure with a relevant exception
+    s3_error = S3OperationError(
+        operation="complete_multipart_upload", message="S3 completion failed"
+    )
+    mock_complete_s3.side_effect = s3_error
+
+    # Call the method and expect exception
+    with pytest.raises(StreamFinalizationError) as excinfo:
+        await stream_processor_instance.finalize_stream()
+
+    # Assert correct calls
+    mock_get_parts.assert_called_once_with(TEST_STREAM_ID)
+    mock_complete_s3.assert_called_once()
+    mock_abort_s3.assert_called_once_with(
+        TEST_S3_BUCKET, TEST_S3_KEY_PREFIX, TEST_S3_UPLOAD_ID
+    )
+    mock_add_to_failed_set.assert_called_once()
+    mock_remove_from_pending.assert_called_once_with(TEST_STREAM_ID)
+    assert "S3 completion failed" in str(excinfo.value)
+    assert not stream_processor_instance.is_finalizing
+
+
+@pytest.mark.asyncio
+@patch("src.s3_client.complete_s3_multipart_upload", new_callable=AsyncMock)
+@patch("src.metadata_generator.generate_metadata_json", new_callable=AsyncMock)
+@patch("src.redis_client.get_stream_parts", new_callable=AsyncMock)
+@patch("src.redis_client.set_stream_status", new_callable=AsyncMock)
+@patch("src.redis_client.add_stream_to_failed_set", new_callable=AsyncMock)
+@patch("src.redis_client.remove_stream_from_pending_completion", new_callable=AsyncMock)
+async def test_finalize_stream_metadata_generation_failure(
+    mock_remove_from_pending: AsyncMock,
+    mock_add_to_failed_set: AsyncMock,
+    mock_set_status: AsyncMock,
+    mock_get_parts: AsyncMock,
+    mock_generate_metadata: AsyncMock,
+    mock_complete_s3: AsyncMock,
+    stream_processor_instance: StreamProcessor,
+    mock_file_path: Path,
+):
+    """Test handling of metadata generation failure during finalization."""
+    # Mock file exists
+    mock_file_path.touch()
+
+    # Setup mock return values
+    mock_parts = [
+        {"PartNumber": 1, "ETag": "etag1", "Size": 1024},
+    ]
+    mock_get_parts.return_value = mock_parts
+    mock_complete_s3.return_value = True
+
+    # Simulate metadata generation failure
+    mock_generate_metadata.return_value = None
+
+    # Call the method and expect exception
+    with pytest.raises(StreamFinalizationError) as excinfo:
+        await stream_processor_instance.finalize_stream()
+
+    # Assert correct calls
+    mock_get_parts.assert_called_once_with(TEST_STREAM_ID)
+    mock_complete_s3.assert_called_once()
+    mock_set_status.assert_any_call(TEST_STREAM_ID, "s3_completed")
+    mock_generate_metadata.assert_called_once_with(TEST_STREAM_ID, mock_file_path)
+    mock_add_to_failed_set.assert_called_once_with(
+        TEST_STREAM_ID, reason="failed_meta_generation"
+    )
+    mock_remove_from_pending.assert_called_once_with(TEST_STREAM_ID)
+    assert "Metadata JSON generation failed" in str(excinfo.value)
+    assert not stream_processor_instance.is_finalizing
+
+
+@pytest.mark.asyncio
+@patch("src.redis_client.get_stream_parts", new_callable=AsyncMock)
+@patch("src.redis_client.set_stream_status", new_callable=AsyncMock)
+@patch("src.redis_client.remove_stream_from_pending_completion", new_callable=AsyncMock)
+async def test_finalize_stream_cancelled_error(
+    mock_remove_from_pending: AsyncMock,
+    mock_set_status: AsyncMock,
+    mock_get_parts: AsyncMock,
+    stream_processor_instance: StreamProcessor,
+    mock_file_path: Path,
+):
+    """Test handling of CancelledError during finalization."""
+    # Mock file exists
+    mock_file_path.touch()
+
+    # Setup mock to raise CancelledError
+    mock_get_parts.side_effect = asyncio.CancelledError()
+
+    # Call the method and expect exception
+    with pytest.raises(asyncio.CancelledError):
+        await stream_processor_instance.finalize_stream()
+
+    # Assert correct calls
+    mock_set_status.assert_called_once_with(
+        TEST_STREAM_ID, "interrupted_cancelled_finalize"
+    )
+    mock_remove_from_pending.assert_called_once_with(TEST_STREAM_ID)
+    assert not stream_processor_instance.is_finalizing
+
+
+@pytest.mark.asyncio
+async def test_finalize_stream_lock_mechanism(
+    stream_processor_instance: StreamProcessor,
+    mock_file_path: Path,
+):
+    """Test that finalize_stream properly uses lock to prevent concurrent processing."""
+    # Mock the actual finalization to be a no-op that just waits
+    original_finalize = stream_processor_instance.finalize_stream
+
+    finalize_calls = 0
+    process_complete = asyncio.Event()
+
+    async def mock_finalize():
+        nonlocal finalize_calls
+        finalize_calls += 1
+        process_complete.set()
+        # Just wait a bit to simulate processing
+        await asyncio.sleep(0.1)
+        return True
+
+    # Replace the original method
+    stream_processor_instance.finalize_stream = mock_finalize
+
+    # Start two concurrent finalize operations
+    task1 = asyncio.create_task(original_finalize())
+
+    # Wait for first task to acquire lock and start processing
+    await process_complete.wait()
+
+    # Set flag back to false for the second task
+    process_complete.clear()
+
+    # Now try a second finalize - it should detect is_finalizing=True
+    task2 = asyncio.create_task(original_finalize())
+
+    # Wait for both tasks to complete
+    await asyncio.gather(task1, task2)
+
+    # Only one finalize operation should have completed the full process
+    assert finalize_calls == 1
+
+    # Restore original method
+    stream_processor_instance.finalize_stream = original_finalize

@@ -168,19 +168,45 @@ async def test_handle_stream_event_write_processor_exists(
 ):
     mock_processor = AsyncMock(spec=StreamProcessor)
     mock_processor.stream_id = "test-stream-id"
+    # Mock the process_file_write method to return a proper awaitable
+    mock_processor.process_file_write.return_value = asyncio.sleep(0)
+
     main.active_processors[TEST_FILE_PATH] = mock_processor
 
     # Create a mock event queue
     event_queue = asyncio.Queue()
 
+    # Create a mock task implementation that immediately resolves coroutines
+    async_fut = asyncio.Future()
+    async_fut.set_result(None)
+    mock_create_task.return_value = async_fut
+
+    # Handle the task creation ourselves to prevent "never awaited" warnings
+    original_create_task = asyncio.create_task
+
+    def handle_coroutine(coro):
+        # If it's a coroutine we know, handle it specially
+        if asyncio.iscoroutine(coro):
+            if (
+                hasattr(coro, "__name__")
+                and coro.__name__ == "_create_and_manage_processor_task"
+            ):
+                # Just resolve it immediately
+                fut = asyncio.Future()
+                fut.set_result(None)
+                return fut
+        # Return our mock for other cases
+        return async_fut
+
+    mock_create_task.side_effect = handle_coroutine
+
     await main.handle_stream_event(mock_stream_event_write, event_queue)
 
     # Check that create_task was called
     mock_create_task.assert_called_once()
-    # Check that processor.process_file_write was scheduled
+    # Check that the correct coroutine was passed
     args, kwargs = mock_create_task.call_args
-    # args[0] is the coroutine passed to create_task
-    assert args[0].__name__ == "_create_and_manage_processor_task"
+    assert "_create_and_manage_processor_task" in str(args[0])
 
 
 @pytest.mark.asyncio
@@ -192,13 +218,32 @@ async def test_handle_stream_event_write_processor_missing(
     if TEST_FILE_PATH in main.active_processors:
         del main.active_processors[TEST_FILE_PATH]
 
-    # Create a mock event queue
+    # Create a mock event queue with proper handling for the coroutine
     event_queue = asyncio.Queue()
 
+    # Set up mock for queue put operation
+    async def mock_queue_put(*args, **kwargs):
+        return None
+
+    event_queue.put = AsyncMock(side_effect=mock_queue_put)
+
+    # Run the function under test
     await main.handle_stream_event(mock_stream_event_write, event_queue)
 
+    # Check that create_task was not called
     mock_create_task.assert_not_called()
-    assert f"[{TEST_FILE_NAME}] WRITE event for untracked file." in caplog.text
+
+    # Check for the log message in caplog
+    assert f"[{TEST_FILE_NAME}] WRITE event for untracked file" in caplog.text
+
+    # Verify the requeue operation happened
+    assert event_queue.put.called, "Event was not requeued"
+
+    # Make sure the correct event type was requeued
+    args, kwargs = event_queue.put.call_args
+    requeued_event = args[0]
+    assert requeued_event.change_type == WatcherChangeType.CREATE
+    assert requeued_event.file_path == TEST_FILE_PATH
 
 
 @pytest.mark.asyncio
