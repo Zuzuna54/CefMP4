@@ -202,19 +202,65 @@ async def test_handle_stream_event_write_processor_missing(
 
 
 @pytest.mark.asyncio
+@patch("src.main.set_stream_status", new_callable=AsyncMock)  # Mock Redis updates
 async def test_handle_stream_event_delete_processor_exists(
-    mock_stream_event_delete: StreamEvent, caplog
+    mock_set_status: AsyncMock, mock_stream_event_delete: StreamEvent, caplog
 ):
     mock_processor = AsyncMock(spec=StreamProcessor)
     mock_processor.stream_id = "proc-to-delete"
+
+    # Track tasks that might be created
+    tasks = []
+    original_create_task = asyncio.create_task
+
+    def mock_create_task(coro, *args, **kwargs):
+        # For any created task, immediately resolve/consume the coroutine
+        # This prevents "coroutine never awaited" warnings
+        if asyncio.iscoroutine(coro):
+            # For coroutines that we know about, we can handle them specially
+            if coro.__name__ == "_create_and_manage_processor_task":
+                # Just return a done task
+                fut = asyncio.Future()
+                fut.set_result(None)
+                return fut
+            elif coro.__name__ == "manage_new_stream_creation":
+                # Just return a done task
+                fut = asyncio.Future()
+                fut.set_result(None)
+                return fut
+            else:
+                # For unknown coroutines, run them in a task that we'll clean up
+                task = original_create_task(coro, *args, **kwargs)
+                tasks.append(task)
+                return task
+        # For non-coroutines, just create a regular task
+        task = original_create_task(coro, *args, **kwargs)
+        tasks.append(task)
+        return task
+
+    # Store the original processor in active_processors
     main.active_processors[TEST_FILE_PATH] = mock_processor
 
     # Create a mock event queue
     event_queue = asyncio.Queue()
 
-    await main.handle_stream_event(mock_stream_event_delete, event_queue)
+    # Apply the patch
+    with patch("asyncio.create_task", side_effect=mock_create_task):
+        await main.handle_stream_event(mock_stream_event_delete, event_queue)
 
+    # Clean up any tasks that were created
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Check that the processor was removed
     assert TEST_FILE_PATH not in main.active_processors
+
+    # Check that set_stream_status was called
+    mock_set_status.assert_called_once_with(mock_processor.stream_id, "deleted_locally")
+
     # Check for the log message with the JSON format
     assert "Removed processor for deleted file" in caplog.text
     assert "proc-to-delete" in caplog.text
@@ -243,7 +289,9 @@ async def test_handle_stream_event_delete_processor_missing(
 @patch("src.main.get_redis_connection", new_callable=AsyncMock)
 @patch("src.main.close_redis_connection", new_callable=AsyncMock)
 @patch("src.main.close_s3_resources", new_callable=AsyncMock)
-@patch("src.main.handle_stream_event", new_callable=AsyncMock)  # Mock event handler
+@patch(
+    "src.main.handle_stream_event"
+)  # Regular function instead of AsyncMock to allow awaiting
 @patch("src.main.get_active_stream_ids", new_callable=AsyncMock)  # Mock Redis calls
 @patch(
     "src.main.get_pending_completion_stream_ids", new_callable=AsyncMock
@@ -251,12 +299,19 @@ async def test_handle_stream_event_delete_processor_missing(
 async def test_main_function_flow(
     mock_get_pending_ids: AsyncMock,
     mock_get_active_ids: AsyncMock,
-    mock_handle_event: AsyncMock,
+    mock_handle_event,
     mock_close_s3: AsyncMock,
     mock_close_redis: AsyncMock,
     mock_get_redis: AsyncMock,
     setup_test_environment,  # Ensure settings.watch_dir is patched by fixture
 ):
+    # Set up mock for handle_stream_event that properly awaits any coroutines
+    async def handle_stream_event_mock(event, event_queue):
+        # This will properly handle awaiting the coroutine
+        return await asyncio.sleep(0)
+
+    mock_handle_event.side_effect = handle_stream_event_mock
+
     # Mock the active and pending stream IDs to be empty
     mock_get_active_ids.return_value = []
     mock_get_pending_ids.return_value = []
@@ -275,15 +330,36 @@ async def test_main_function_flow(
         yield event1
         yield event2
         main.shutdown_signal_event.set()
+        return
 
-    # Apply the patch for the duration of this test
-    with patch("src.main.video_file_watcher", return_value=mock_watcher_gen()):
+    # We need to ensure any tasks created inside main() are properly awaited
+    original_create_task = asyncio.create_task
+    tasks = []
+
+    def mock_create_task(coro, *args, **kwargs):
+        # Capture the task so we can ensure it's awaited later
+        task = original_create_task(coro, *args, **kwargs)
+        tasks.append(task)
+        return task
+
+    # Apply the patches for the duration of this test
+    with (
+        patch("src.main.video_file_watcher", return_value=mock_watcher_gen()),
+        patch("asyncio.create_task", side_effect=mock_create_task),
+    ):
         # Run main with a timeout
         try:
             await asyncio.wait_for(main.main(), timeout=2.0)
         except asyncio.TimeoutError:
             # This should not happen if our mock is working correctly
-            pass
+            main.shutdown_signal_event.set()
+
+    # Ensure all tasks are cleaned up
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     # Reset shutdown signal for other tests
     main.shutdown_signal_event = asyncio.Event()
