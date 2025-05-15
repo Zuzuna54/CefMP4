@@ -1,0 +1,51 @@
+sequenceDiagram
+    participant FS as Filesystem
+    participant Watcher as FileWatcher
+    participant Main as MainEventLoop
+    participant Processor as StreamProcessor
+    participant Redis as Redis
+    participant S3 as S3/MinIO
+    
+    Note over Watcher,Main: Application Startup
+    
+    Main->>Watcher: Start file watcher (video_file_watcher)
+    activate Watcher
+    
+    Note over FS,Watcher: File Created Scenario
+    
+    FS->>Watcher: File Created Event (.mp4)
+    Watcher->>Watcher: Track in _active_files_last_event_write
+    Watcher->>Main: Emit StreamEvent(CREATE, file_path)
+    Main->>Main: handle_stream_event(CREATE)
+    Main->>Main: manage_new_stream_creation()
+    Main->>S3: create_s3_multipart_upload()
+    S3-->>Main: Return upload_id
+    Main->>Redis: init_stream_metadata()
+    Main->>Processor: Create new StreamProcessor
+    Main->>Processor: _initialize_from_checkpoint()
+    Main->>Main: Store in active_processors
+    Main->>Processor: process_file_write() (async task)
+    
+    Note over FS,Watcher: File Modified Scenario
+    
+    FS->>Watcher: File Modified Event (.mp4)
+    Watcher->>Watcher: Update _active_files_last_event_write
+    Watcher->>Main: Emit StreamEvent(WRITE, file_path)
+    Main->>Main: handle_stream_event(WRITE)
+    Main->>Main: Lookup processor in active_processors
+    Main->>Processor: process_file_write() (async task)
+    
+    Note over FS,Watcher: File Deleted Scenario
+    
+    FS->>Watcher: File Deleted Event (.mp4)
+    Watcher->>Watcher: Remove from _active_files_last_event_write
+    Watcher->>Main: Emit StreamEvent(DELETE, file_path)
+    Main->>Main: handle_stream_event(DELETE)
+    Main->>Main: Remove from active_processors
+    
+    Note over FS,Watcher: Application Shutdown
+    
+    Main->>Watcher: Set stop_event
+    deactivate Watcher
+    
+    Note over Watcher: IDLE detection happens<br>in periodic_stale_stream_check<br>separate from watcher 

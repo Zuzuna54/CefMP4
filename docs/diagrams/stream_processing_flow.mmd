@@ -1,0 +1,44 @@
+flowchart TD
+    start[Application Start] --> check_resume{Check for\nIncomplete Streams}
+    check_resume -->|Yes| resume[Resume Streams\nfrom Redis Checkpoints]
+    check_resume -->|No| watch
+    
+    resume --> watch[Start File Watcher]
+    
+    watch --> create{Detect File Events}
+    
+    create -->|CREATE| init[Initialize Stream\n- Generate Stream ID\n- Create S3 Multipart Upload\n- Store Initial Metadata in Redis]
+    init --> initial_write[Process Initial File Content]
+    
+    create -->|WRITE| write[Process New Data\n- Read File Chunks\n- Upload to S3 as Parts\n- Update Redis Checkpoints]
+    
+    create -->|DELETE| delete[Cleanup\n- Remove from Active Processors\n- Mark for Later Cleanup]
+    
+    subgraph "Periodic Check (Separate Task)"
+        idle_check[Check Redis for Inactive Streams]
+        idle_check --> check_timeout{Inactive for\nStream Timeout?}
+        check_timeout -->|Yes| mark_idle[Mark as Pending Completion]
+        check_timeout -->|No| continue[Continue Monitoring]
+    end
+    
+    mark_idle --> trigger_finalize[Trigger Stream Finalization]
+    
+    trigger_finalize --> finalize["Finalize Stream:
+    - Complete S3 Multipart Upload
+    - Generate File Metadata
+    - Upload Metadata JSON to S3
+    - Update Redis Status"]
+    
+    finalize --> check_success{Success?}
+    check_success -->|Yes| completed[Add to Completed Set\nCleanup Redis Checkpoints]
+    check_success -->|No| failed[Add to Failed Set\nLog Error]
+    
+    classDef start fill:#d5f5e3,stroke:#27ae60,stroke-width:2px;
+    classDef process fill:#b3e0ff,stroke:#2e86c1,stroke-width:2px;
+    classDef decision fill:#fdebd0,stroke:#f39c12,stroke-width:2px;
+    classDef endpoint fill:#fadbd8,stroke:#e74c3c,stroke-width:2px;
+    
+    class start,watch start;
+    class init,write,delete,resume,initial_write,idle_check,mark_idle,trigger_finalize,finalize process;
+    class check_resume,create,check_timeout,check_success decision;
+    class completed,failed,continue endpoint; 

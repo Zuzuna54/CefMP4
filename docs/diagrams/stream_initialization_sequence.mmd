@@ -1,0 +1,51 @@
+sequenceDiagram
+    participant Main as MainEventLoop
+    participant Processor as StreamProcessor
+    participant S3 as S3/MinIO
+    participant Redis as Redis
+    participant Metrics as Metrics
+    
+    Note over Main: Receive CREATE event for new file
+    
+    Main->>Main: manage_new_stream_creation(event)
+    Main->>Main: Generate UUID for stream_id
+    
+    Main->>S3: create_s3_multipart_upload(bucket, key_prefix)
+    S3-->>Main: Return upload_id
+    
+    alt S3 Upload ID Not Received
+        Main->>Main: Log error & abort
+    else S3 Upload ID Received
+        Main->>Redis: init_stream_metadata(stream_id, file_path, upload_id, bucket, key_prefix)
+        Redis-->>Main: Return confirmation
+        
+        Main->>Processor: Create new StreamProcessor instance
+        Main->>Processor: _initialize_from_checkpoint()
+        Note over Processor: Even for new streams, initialize from<br>checkpoint is called to ensure<br>consistent behavior with resumed streams
+        
+        Processor->>Redis: get_stream_meta(stream_id)
+        Redis-->>Processor: Return metadata (or empty for new stream)
+        
+        Processor->>Redis: get_stream_next_part(stream_id)
+        Redis-->>Processor: Return null (for new stream)
+        
+        Processor->>Redis: get_stream_bytes_sent(stream_id)
+        Redis-->>Processor: Return null (for new stream)
+        
+        Processor->>Redis: get_stream_parts(stream_id)
+        Redis-->>Processor: Return empty list (for new stream)
+        
+        Processor->>Processor: Set next_part_number = 1
+        Processor->>Processor: Set current_file_offset = 0
+        
+        Main->>Main: Store processor in active_processors[file_path]
+        Main->>Metrics: ACTIVE_STREAMS_GAUGE.inc()
+        
+        Main->>Main: Create new task for processor.process_file_write()
+        
+        alt Initial file has content
+            Processor->>Processor: Begin reading and processing file content
+        else Initial file is empty
+            Processor->>Processor: Wait for WRITE events
+        end
+    end 

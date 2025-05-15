@@ -1,0 +1,77 @@
+sequenceDiagram
+    participant Main as MainEventLoop
+    participant Resume as ResumeProcessor
+    participant Processor as StreamProcessor
+    participant Redis as Redis
+    participant S3 as S3/MinIO
+    participant File as FileSystem
+    
+    Note over Main: Application Startup
+    
+    Main->>Redis: get_active_stream_ids()
+    Redis-->>Main: Return active stream IDs
+    
+    Main->>Redis: get_pending_completion_stream_ids()
+    Redis-->>Main: Return pending completion stream IDs
+    
+    alt No Streams to Resume
+        Main->>Main: Log "No streams to resume"
+    else Streams Found for Resume
+        Main->>Main: Log "Found N streams to resume"
+        
+        loop For each stream_id to resume
+            Main->>Resume: resume_stream_processing(stream_id)
+            activate Resume
+            
+            Resume->>Redis: get_stream_meta(stream_id)
+            Redis-->>Resume: Return stream metadata
+            
+            alt Metadata Missing or Incomplete
+                Resume->>Resume: Log error and skip
+            else Valid Metadata
+                Resume->>Resume: Extract file_path, s3_upload_id, etc.
+                
+                Resume->>Processor: Create new StreamProcessor
+                
+                Resume->>Processor: _initialize_from_checkpoint()
+                activate Processor
+                
+                Processor->>Redis: get_stream_meta(stream_id)
+                Redis-->>Processor: Return metadata
+                
+                Processor->>Redis: get_stream_next_part(stream_id)
+                Redis-->>Processor: Return next_part_number
+                
+                Processor->>Redis: get_stream_bytes_sent(stream_id)
+                Redis-->>Processor: Return bytes_sent
+                
+                Processor->>Redis: get_stream_parts(stream_id)
+                Redis-->>Processor: Return parts list
+                
+                Processor->>Processor: Update internal state
+                
+                Processor->>File: Check if file exists
+                
+                alt File Missing
+                    Processor->>Redis: add_stream_to_failed_set(stream_id, "file_missing_on_resume")
+                    Processor-->>Resume: Raise FileNotFoundError
+                    Resume->>Resume: Log error and continue to next stream
+                else File Exists
+                    Processor-->>Resume: Return successfully initialized
+                    deactivate Processor
+                    
+                    Resume->>Main: Add to active_processors
+                    
+                    alt Status is "pending_completion" or "s3_completed"
+                        Resume->>Processor: finalize_stream()
+                    else Status is "processing" or null
+                        Resume->>Processor: process_file_write()
+                    end
+                end
+            end
+            deactivate Resume
+        end
+    end
+    
+    Main->>Main: Continue with normal startup
+    Main->>Main: Start file watcher and stale check 

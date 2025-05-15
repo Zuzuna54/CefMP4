@@ -1,0 +1,61 @@
+graph TD
+    subgraph "CI Pipeline (.github/workflows/ci.yml)"
+        trigger("Code Push/PR") --> lint("Lint with ruff")
+        trigger --> format("Format Check<br>ruff format")
+        trigger --> typecheck("Type Check<br>with mypy")
+        
+        lint & format & typecheck --> unit_tests("Run Unit Tests<br>with pytest")
+        
+        unit_tests --> coverage("Generate Coverage<br>Report")
+        
+        unit_tests --> integration_tests("Run Integration Tests<br>with Docker Compose")
+        
+        integration_tests --> setup_deps("Set Up Dependencies<br>Redis & MinIO")
+        setup_deps --> build_app("Build App<br>Container")
+        build_app --> run_app("Run App")
+        run_app --> copy_test("Copy Test MP4<br>to Watch Dir")
+        copy_test --> wait("Wait for<br>Processing")
+        wait --> verify("Verify S3 Upload<br>& Metadata")
+        verify --> cleanup("Clean Up<br>Docker Resources")
+        
+        coverage & cleanup --> success("Build Success/Failure")
+    end
+    
+    subgraph "Docker Image Build"
+        docker_build("Docker Build") --> multi_stage("Multi-Stage Build")
+        
+        multi_stage --> build_stage("Build Stage<br>- Install build deps<br>- Generate requirements.txt<br>- Install Python deps")
+        
+        build_stage --> final_stage("Final Stage<br>- Python 3.12 slim<br>- Install ffmpeg<br>- Copy app code<br>- Set up non-root user")
+        
+        final_stage --> image("Docker Image")
+    end
+    
+    subgraph "Deployment (Conceptual)"
+        deploy("Deploy Stage<br>(Triggered on main)") --> image_push("Push Docker Image<br>to Registry")
+        
+        image_push --> deploy_env{Environment?}
+        
+        deploy_env -->|Development| dev_deploy("Deploy to<br>Development")
+        deploy_env -->|Staging| staging_deploy("Deploy to<br>Staging")
+        deploy_env -->|Production| prod_deploy("Deploy to<br>Production")
+        
+        dev_deploy & staging_deploy & prod_deploy --> configure("Configure with<br>Environment Variables")
+        
+        configure --> monitor("Monitor<br>Application")
+    end
+    
+    success --> docker_build
+    image --> deploy
+    
+    classDef trigger fill:#d6eaf8,stroke:#3498db,stroke-width:2px
+    classDef test fill:#d5f5e3,stroke:#27ae60,stroke-width:2px
+    classDef build fill:#fdebd0,stroke:#f39c12,stroke-width:2px
+    classDef deploy fill:#f5eef8,stroke:#8e44ad,stroke-width:2px
+    classDef decision fill:#ebdef0,stroke:#8e44ad,stroke-width:2px
+    
+    class trigger,docker_build,deploy trigger;
+    class lint,format,typecheck,unit_tests,coverage,integration_tests,setup_deps,copy_test,wait,verify test;
+    class build_app,run_app,cleanup,multi_stage,build_stage,final_stage,image build;
+    class success,image_push,dev_deploy,staging_deploy,prod_deploy,configure,monitor deploy;
+    class deploy_env decision; 

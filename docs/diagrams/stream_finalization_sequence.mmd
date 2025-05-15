@@ -1,0 +1,80 @@
+sequenceDiagram
+    participant StaleCheck as StaleStreamChecker
+    participant Main as MainEventLoop
+    participant Processor as StreamProcessor
+    participant Redis as Redis
+    participant S3 as S3/MinIO
+    participant Metrics as Metrics
+    
+    Note over StaleCheck: periodic_stale_stream_check runs periodically
+    
+    StaleCheck->>Redis: get_active_stream_ids()
+    Redis-->>StaleCheck: Return list of active stream_ids
+    
+    loop For each active stream_id
+        StaleCheck->>Redis: get_stream_meta(stream_id)
+        Redis-->>StaleCheck: Return metadata including last_activity_at_utc
+        
+        StaleCheck->>StaleCheck: Calculate inactivity duration
+        
+        alt Inactive for > stream_timeout_seconds
+            StaleCheck->>Redis: move_stream_to_pending_completion(stream_id)
+            StaleCheck->>Main: Lookup processor by file_path
+            Main-->>StaleCheck: Return processor instance
+            
+            StaleCheck->>Processor: finalize_stream() (async task)
+            
+            activate Processor
+            Processor->>Processor: Acquire lock
+            
+            Processor->>Redis: get_stream_parts(stream_id)
+            Redis-->>Processor: Return all uploaded parts with ETags
+            
+            alt No Parts Found
+                Processor->>S3: abort_s3_multipart_upload(bucket, key, upload_id)
+                Processor->>Redis: set_stream_status(stream_id, "aborted_no_parts")
+                Processor->>Redis: remove_stream_from_pending_completion(stream_id)
+                Processor->>Redis: add_stream_to_failed_set(stream_id)
+                Processor->>Metrics: STREAMS_FAILED_TOTAL.inc()
+            else Parts Available
+                Processor->>S3: complete_s3_multipart_upload(bucket, key, upload_id, parts)
+                S3-->>Processor: Return success/failure
+                
+                alt S3 Completion Failed
+                    Processor->>Redis: set_stream_status(stream_id, "failed_s3_complete")
+                    Processor->>Redis: add_stream_to_failed_set(stream_id)
+                    Processor->>Metrics: STREAMS_FAILED_TOTAL.inc()
+                else S3 Completion Succeeded
+                    Processor->>Redis: set_stream_status(stream_id, "s3_completed")
+                    
+                    Note over Processor: Metadata Generation
+                    
+                    Processor->>Processor: get_video_duration(file_path)
+                    Processor->>Processor: generate_metadata_json()
+                    
+                    Processor->>S3: upload_json_to_s3(bucket, key+".metadata.json", metadata)
+                    S3-->>Processor: Return success/failure
+                    
+                    alt Metadata Upload Failed
+                        Processor->>Redis: set_stream_status(stream_id, "failed_metadata_upload")
+                        Processor->>Redis: add_stream_to_failed_set(stream_id)
+                        Processor->>Metrics: STREAMS_FAILED_TOTAL.inc()
+                    else Metadata Upload Succeeded
+                        Processor->>Redis: set_stream_status(stream_id, "completed")
+                        Processor->>Redis: add_stream_to_completed_set(stream_id)
+                        Processor->>Redis: remove_stream_keys(stream_id)
+                        Processor->>Metrics: STREAMS_COMPLETED_TOTAL.inc()
+                        Processor->>Metrics: VIDEO_STREAM_DURATION_SECONDS.observe()
+                        Processor->>Metrics: VIDEO_PROCESSING_TIME_SECONDS.observe()
+                    end
+                end
+            end
+            
+            Processor->>Processor: Release lock
+            deactivate Processor
+            
+            StaleCheck->>Main: run_finalization_and_cleanup(processor, file_path)
+            Main->>Main: Remove from active_processors
+            Main->>Metrics: ACTIVE_STREAMS_GAUGE.dec()
+        end
+    end 

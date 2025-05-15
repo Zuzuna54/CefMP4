@@ -5,6 +5,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: # Allow PROM_PORT to be passed during build
+        PROM_PORT: ${PROM_PORT:-8000}
     container_name: cefmp4_processor_app
     restart: unless-stopped
     volumes:
@@ -12,6 +14,7 @@ services:
       # - ./src:/app/src # For development: live code reload (requires watchdog or similar in app)
     environment:
       - PYTHONUNBUFFERED=1
+      - PYTHONIOENCODING=UTF-8 # Added for good measure
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - APP_ENV=${APP_ENV:-production} # Default to production in Docker
       - S3_ENDPOINT_URL=${S3_ENDPOINT_URL:-http://minio:9000}
@@ -22,7 +25,8 @@ services:
       - STREAM_TIMEOUT_SECONDS=${STREAM_TIMEOUT_SECONDS:-30}
       - CHUNK_SIZE_BYTES=${CHUNK_SIZE_BYTES:-10485760} # 10MB
       - FFPROBE_PATH=${FFPROBE_PATH}
-      - PROM_PORT=${PROM_PORT:-8000} # Added PROM_PORT env var
+      - PROM_PORT=${PROM_PORT:-8000}
+      - MAX_CONCURRENT_STREAMS=${MAX_CONCURRENT_STREAMS:-5} # Added from main.py
     ports:
       - "${PROM_PORT:-8000}:${PROM_PORT:-8000}" # Expose PROM_PORT
     depends_on:
@@ -32,18 +36,30 @@ services:
         condition: service_healthy
     networks:
       - cefmp4_network
+    healthcheck: # Added healthcheck for app
+      test: ["CMD", "curl", "-f", "http://localhost:${PROM_PORT:-8000}/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s # Give app time to start metrics server
 
   minio:
     image: minio/minio:RELEASE.2023-09-07T02-05-02Z
     ports:
-      - "9000:9000" # S3 API
-      - "9001:9001" # MinIO Console
+      - "9000:9000"
+      - "9001:9001"
     volumes:
       - minio-data:/data
     environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-minioadmin} # Changed to S3_ACCESS_KEY_ID
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-minioadmin} # Changed to S3_SECRET_ACCESS_KEY
     command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   redis:
     image: redis:7-alpine
@@ -51,7 +67,16 @@ services:
       - redis-data:/data
     # ports: # Uncomment to expose Redis for direct debugging
     #   - "6379:6379"
+    healthcheck: # Added healthcheck for redis
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
   minio-data:
   redis-data:
+
+networks:
+  cefmp4_network:
+    driver: bridge

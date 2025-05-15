@@ -1,0 +1,71 @@
+flowchart TD
+    subgraph "Structured Logging (structlog)"
+        log_setup("LoggingConfig<br>setup_logging()") --> configure_structlog("Configure structlog<br>with processors")
+        
+        configure_structlog --> log_handlers{Environment?}
+        log_handlers -->|Development| dev_renderer("ConsoleRenderer<br>Pretty Output")
+        log_handlers -->|Production| json_renderer("JSONRenderer<br>Machine-Readable")
+        
+        dev_renderer & json_renderer --> core_processors("Core Processors:<br>- contextvars<br>- add_logger_name<br>- add_log_level<br>- format_exc_info<br>- TimeStamper")
+        
+        core_processors --> stdout("Stream to stdout")
+        
+        log_context("Context Variables<br>bind_contextvars") -->|Add stream_id<br>file_path, etc.| log_events("Logger Calls<br>Throughout Code")
+        
+        log_events --> |Error Logs| error_logs("Error Log<br>Entries")
+        log_events --> |Info Logs| info_logs("Info Log<br>Entries")
+        log_events --> |Debug Logs| debug_logs("Debug Log<br>Entries")
+        
+        debug_logs & info_logs & error_logs --> process_logs("Process Logs<br>with structlog")
+        
+        process_logs --> output("Output to<br>Console/JSON")
+    end
+    
+    subgraph "Prometheus Metrics"
+        metrics_init("Define Metrics<br>in src/metrics.py") --> counters("Counters:<br>- VIDEO_CHUNKS_UPLOADED_TOTAL<br>- VIDEO_BYTES_UPLOADED_TOTAL<br>- VIDEO_FAILED_OPERATIONS_TOTAL<br>- STREAMS_COMPLETED_TOTAL<br>- STREAMS_FAILED_TOTAL")
+        
+        metrics_init --> histograms("Histograms:<br>- VIDEO_STREAM_DURATION_SECONDS<br>- VIDEO_PROCESSING_TIME_SECONDS")
+        
+        metrics_init --> gauges("Gauges:<br>- ACTIVE_STREAMS_GAUGE")
+        
+        counters & histograms & gauges --> inc_metrics("Increment/Observe<br>Metrics in Code")
+        
+        inc_metrics --> upload_metrics("Chunk Upload<br>Metrics")
+        inc_metrics --> complete_metrics("Stream Completion<br>Metrics")
+        inc_metrics --> error_metrics("Error<br>Metrics")
+        inc_metrics --> duration_metrics("Duration<br>Metrics")
+        
+        upload_metrics & complete_metrics & error_metrics & duration_metrics --> registry("Prometheus<br>Registry")
+        
+        start_server("start_metrics_server<br>on Port 8000") --> registry
+        
+        registry --> prometheus_endpoint("Expose /metrics<br>HTTP Endpoint")
+        
+        prometheus_endpoint --> scrape("External Prometheus<br>Scrapes Metrics")
+        
+        scrape --> dashboards("Grafana<br>Dashboards")
+        scrape --> alerts("Prometheus<br>Alerts")
+    end
+    
+    subgraph "Log and Metric Integration"
+        app_start("Application<br>Startup") --> setup_logging
+        app_start --> start_metrics
+        
+        setup_logging("Set up<br>structlog") --> start_metrics("Start Prometheus<br>Metrics Server")
+        
+        error_handler("Error<br>Handler") --> update_both("Update Both<br>Logs and Metrics")
+        
+        update_both --> error_log("Log Structured<br>Error Details")
+        update_both --> error_counter("Increment Error<br>Counter Metric")
+    end
+    
+    classDef setup fill:#d6eaf8,stroke:#3498db,stroke-width:2px
+    classDef process fill:#d5f5e3,stroke:#27ae60,stroke-width:2px
+    classDef storage fill:#fdebd0,stroke:#f39c12,stroke-width:2px
+    classDef output fill:#f5eef8,stroke:#8e44ad,stroke-width:2px
+    
+    class log_setup,metrics_init,app_start setup;
+    class configure_structlog,core_processors,log_context,process_logs,inc_metrics,upload_metrics,complete_metrics,error_metrics,duration_metrics,start_server,error_handler,update_both process;
+    class registry,log_events storage;
+    class dev_renderer,json_renderer,stdout,output,prometheus_endpoint,scrape,dashboards,alerts,error_log,error_counter output;
+    class log_handlers decision; 

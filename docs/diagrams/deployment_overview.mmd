@@ -1,0 +1,51 @@
+graph TD
+    subgraph "Docker Compose Environment"
+        subgraph "App Container"
+            app("CefMP4 Stream Processor\nPython 3.12")
+            ffprobe("FFprobe")
+            metrics("Prometheus Metrics\nHTTP Server :8000")
+            
+            app --> ffprobe
+            app --> metrics
+        end
+        
+        subgraph "MinIO Container"
+            minio_api("MinIO S3 API\n:9000")
+            minio_console("MinIO Console\n:9001")
+            minio_storage[("Object Storage\nVolume")]
+            
+            minio_api --> minio_storage
+            minio_console --> minio_api
+        end
+        
+        subgraph "Redis Container"
+            redis("Redis Server\n:6379")
+            redis_storage[("Redis Volume")]
+            
+            redis --> redis_storage
+        end
+        
+        watch_dir[("Watch Directory\nVolume")]
+        
+        app --> |S3 API| minio_api
+        app --> |Redis Client| redis
+        app --> |Monitors| watch_dir
+    end
+    
+    subgraph "External"
+        prometheus("Prometheus")
+        user("User")
+        
+        prometheus --> |Scrapes :8000| metrics
+        user --> |Places MP4 Files| watch_dir
+        user --> |Views Results| minio_console
+    end
+    
+    classDef container fill:#d5f5e3,stroke:#27ae60,stroke-width:2px
+    classDef service fill:#b3e0ff,stroke:#2e86c1,stroke-width:2px
+    classDef volume fill:#f9e79f,stroke:#f1c40f,stroke-width:2px
+    classDef external fill:#fadbd8,stroke:#e74c3c,stroke-width:2px
+    
+    class app,ffprobe,metrics,minio_api,minio_console,redis service;
+    class minio_storage,redis_storage,watch_dir volume;
+    class prometheus,user external; 

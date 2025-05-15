@@ -1,0 +1,87 @@
+---
+title: CefMP4 Stream Processor Design Decisions
+---
+mindmap
+    root((CefMP4))
+        Core Building Blocks
+            ::icon(fa fa-cubes)
+            Async Architecture
+                ::icon(fa fa-bolt)
+                asyncio for I/O
+                Non-blocking event loop
+                Concurrent processing
+            File Handling
+                ::icon(fa fa-file-video)
+                watchfiles library
+                Event types
+                    CREATE/WRITE
+                    DELETE/IDLE
+                Chunk processing
+                    File offset tracking
+                    Fixed-size uploads
+                    ETags for validation
+            State Management
+                ::icon(fa fa-database)
+                Redis checkpoints
+                    Stream metadata in hashes
+                    Resume capability
+                    Status tracking
+                Stream lifecycle
+                    ::icon(fa fa-retweet)
+                    processing → pending_completion → completed/failed
+
+        Core Processes
+            ::icon(fa fa-cogs)
+            Processor Model[One instance per active stream]
+            Stream Processing Flow
+                Initial setup
+                Chunk processing
+                Finalization
+            Task Control
+                ::icon(fa fa-tasks)
+                Semaphore limiting
+                Cancellation handling
+                Graceful shutdown
+
+        External Integration
+            ::icon(fa fa-plug)
+            Storage Strategy
+                ::icon(fa fa-cloud)
+                S3 operations
+                    Multipart upload
+                    Part management
+                    Resume capabilities
+                File structure
+                    ::icon(fa fa-folder)
+                    streams/id/filename
+                    Metadata JSON
+            Observability
+                ::icon(fa fa-chart-line)
+                Logging
+                    JSON format
+                    Context binding
+                    Exception details
+                Metrics
+                    Processing times
+                    Success/failure counts
+                    Active stream gauge
+
+        Reliability
+            ::icon(fa fa-shield-alt)
+            Error Handling))Bang((
+                Typed exceptions
+                Structured logging
+                Custom exception hierarchy
+            Recovery{{Cloud}}
+                Resume on restart
+                Continue from last byte
+                Upload recovery
+
+        Operations
+            ::icon(fa fa-cog)
+            Deployment
+                ::icon(fa fa-docker)
+                Docker container
+                Multi-stage build
+                Non-root security
+            Configuration[Environment variables]

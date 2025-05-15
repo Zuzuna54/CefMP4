@@ -21,11 +21,17 @@ CefMP4 Stream Processor monitors a specified directory for MP4 video files. When
   - [Phase 3: Stream State & S3 Initialization](#phase-3-stream-state--s3-initialization)
   - [Phase 4: Chunk Processing & S3 Upload](#phase-4-chunk-processing--s3-upload)
   - [Phase 5: Stream Finalization & S3 Completion](#phase-5-stream-finalization--s3-completion)
+  - [Phase 6: Metadata Generation (ffprobe & JSON)](#phase-6-metadata-generation-ffprobe--json)
+  - [Phase 7: Checkpoint Recovery & Resume Logic](#phase-7-checkpoint-recovery--resume-logic)
+  - [Phase 8: Robust Error Handling & Graceful Shutdown](#phase-8-robust-error-handling--graceful-shutdown)
+  - [Phase 9: Observability (Logging & Metrics)](#phase-9-observability-logging--metrics)
+  - [Phase 10: Finalizing Dockerization, CI, Documentation & Testing](#phase-10-finalizing-dockerization-ci-documentation--testing)
 - [Testing](#testing)
 - [Development Notes](#development-notes)
 - [Observability](#observability)
   - [Logging](#logging)
   - [Metrics](#metrics)
+- [Troubleshooting](#troubleshooting)
 
 ## Prerequisites
 
@@ -77,18 +83,24 @@ Configuration is managed via environment variables, loaded from an `.env` file u
 
 (Refer to `src/config.py` and `example.env` for a full list and default values)
 
+- `APP_ENV`: Application environment (`development` or `production`). Default: `development` (local), `production` (Docker).
+- `LOG_LEVEL`: Logging level (e.g., `INFO`, `DEBUG`, `WARNING`). Default: `INFO`.
+- `PROM_PORT`: Port for the Prometheus metrics endpoint. Default: `8000`.
+- `MAX_CONCURRENT_STREAMS`: Maximum number of streams to process concurrently. Default: `5`.
+
 - `WATCH_DIR`: Directory the application monitors for video files (e.g., `./local_watch_dir`).
-- `PYTHON_LOG_LEVEL`: Logging level (e.g., `INFO`, `DEBUG`).
+- `CHUNK_SIZE_BYTES`: Size of chunks in bytes for S3 multipart uploads (e.g., `10485760` for 10MB).
+- `STREAM_TIMEOUT_SECONDS`: Idle time in seconds after which a stream is checked for finalization. Default: `30`.
+
 - `S3_ENDPOINT_URL`: URL for the S3-compatible service (e.g., `http://localhost:9000` for local MinIO).
 - `S3_ACCESS_KEY_ID`: S3 access key.
 - `S3_SECRET_ACCESS_KEY`: S3 secret key.
 - `S3_BUCKET_NAME`: S3 bucket to upload files to.
-- `REDIS_HOST`: Redis host (e.g., `localhost`).
-- `REDIS_PORT`: Redis port (e.g., `6379`).
-- `STREAM_CHUNK_SIZE_MB`: Size of chunks (in MB) for S3 multipart uploads.
-- `STREAM_TIMEOUT_SECONDS`: Idle time in seconds after which a stream is considered stale and checked for finalization.
-- `WATCH_FILTER_GLOBS`: Glob patterns for files to watch (e.g., `["*.mp4", "*.mov"]`).
-- `WATCH_FILE_MIN_AGE_SECONDS_FOR_IDLE`: Minimum age of a file with no activity before it's considered idle by the watcher.
+- `S3_REGION_NAME`: S3 region (optional for MinIO).
+
+- `REDIS_URL`: Connection URL for Redis (e.g., `redis://localhost:6379/0`).
+
+- `FFPROBE_PATH`: Optional: Full path to the `ffprobe` executable if not in system PATH.
 
 ## Setup
 
@@ -261,6 +273,37 @@ The application processes video files in several stages, evolving through develo
     - Startup Sequence: The main application startup logic first attempts to resume any interrupted streams before initiating new file watching or other periodic tasks.
   - Idempotency: Operations are designed to be idempotent where possible, or state checks are performed to prevent issues if an operation is re-tried during resume (e.g., not re-finalizing an already completed stream).
 
+### Phase 8: Robust Error Handling & Graceful Shutdown
+
+- **Goal**: Enhance application resilience with custom exceptions, robust retry logic for transient errors (especially network I/O), and ensure graceful shutdown on signals like SIGINT/SIGTERM.
+- **Key Components**:
+  - `src/exceptions.py`: Defines custom application-specific exceptions (e.g., `StreamInitializationError`, `ChunkProcessingError`, `S3OperationError`, `RedisOperationError`).
+  - `src/utils/retry.py`: Implements `async_retry_transient` decorator using `tenacity` for retrying operations prone to transient failures.
+  - `src/main.py`: Signal handlers for `SIGINT` and `SIGTERM` set a `shutdown_signal_event`. The main loop and task creation helpers respect this event to stop new work and cancel ongoing tasks. A semaphore (`stream_processing_semaphore` based on `MAX_CONCURRENT_STREAMS`) is used to limit concurrent stream processing.
+  - `src/s3_client.py`, `src/redis_client.py`: Key functions decorated with `async_retry_transient` to handle transient network issues.
+  - `src/stream_processor.py`: Enhanced error handling to catch specific exceptions, use `add_stream_to_failed_set`, and coordinate with the shutdown signal.
+
+### Phase 9: Observability (Logging & Metrics)
+
+- **Goal**: Implement comprehensive structured logging using `structlog` for improved diagnostics and set up Prometheus metrics for monitoring application performance and health.
+- **Key Components**:
+  - `src/logging_config.py`: Configures `structlog` for structured JSON logging in production and console rendering in development. Manages log levels and mutes noisy loggers.
+  - `structlog` Integration: Replaced standard `logging` with `structlog` across all relevant modules. `StreamProcessor` uses bound loggers with `stream_id` for contextual logging.
+  - `src/metrics.py`: Defines Prometheus metrics (Counters, Gauges, Histograms) for key application events like chunks/bytes uploaded, stream duration, processing time, active streams, and error counts.
+  - `src/main.py`: Initializes the Prometheus metrics server (`start_metrics_server`) on `PROM_PORT` (e.g., 8000) exposing a `/metrics` endpoint. Manages `ACTIVE_STREAMS_GAUGE`.
+  - `src/stream_processor.py` & other modules: Instrumented to increment/observe relevant Prometheus metrics during operations (e.g., uploads, finalization, errors).
+  - `Dockerfile`, `docker-compose.yml`: Updated to expose `PROM_PORT`.
+
+### Phase 10: Finalizing Dockerization, CI, Documentation & Testing
+
+- **Goal**: Polish the application, establish a CI pipeline, complete documentation, and ensure the system is robust.
+- **Key Components (Focus on non-testing for this update)**:
+  - `Dockerfile`: Installs `ffmpeg` (for `ffprobe`), sets up a non-root user (`appuser`) for running the application. `ENTRYPOINT` is set to directly run the application via `python -m src.main`.
+  - `docker-compose.yml`: Refined for local development and testing, including healthchecks for `app`, `minio`, and `redis` services. Uses environment variables from `.env` extensively.
+  - `README.md`: Comprehensively updated with detailed setup, configuration, operational instructions, and troubleshooting tips.
+  - `.github/workflows/ci.yml`: Basic CI pipeline established using GitHub Actions for linting (`ruff check`), formatting checks (`ruff format --check`), and type checking (`mypy`).
+  - `example.env`: Finalized to include all relevant configurable parameters with clear comments and defaults.
+
 ## Testing
 
 Unit and integration tests are located in the `tests/` directory and can be run using `pytest`.
@@ -326,3 +369,14 @@ scrape_configs:
     static_configs:
       - targets: ["localhost:8000"] # Adjust target to your app's host and PROM_PORT
 ```
+
+## Troubleshooting
+
+- **`active_streams_gauge` shows negative value:** This indicates an imbalance in metric increments/decrements. This was a known issue and should be resolved. If it persists, review `ACTIVE_STREAMS_GAUGE.inc()` and `.dec()` calls in `src/main.py`.
+- **Cannot connect to MinIO/Redis:**
+  - Ensure MinIO and Redis containers are running: `docker ps`.
+  - Check `S3_ENDPOINT_URL` and `REDIS_URL` in your `.env` file. If running the app outside Docker but services in Docker, these should point to `localhost`. If running the app inside Docker, they should point to the service names (e.g., `http://minio:9000`, `redis://redis:6379/0`).
+  - Verify MinIO credentials (`S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`) match those used to start the MinIO service.
+- **Permission errors writing to `local_watch_dir` (when app is in Docker):** Ensure the directory on the host machine that is volume-mounted into `/app/local_watch_dir` has appropriate write permissions for the `appuser` (UID 1001) inside the container. For local testing, a simple `chmod -R 777 local_watch_dir` on the host can work, but adjust permissions as needed for your environment.
+- **`ffprobe` not found:** If the application logs errors about `ffprobe` not being found, and you are not running in Docker, ensure `ffmpeg` (which includes `ffprobe`) is installed and in your system's PATH, or set the `FFPROBE_PATH` environment variable to its full path.
+- **Metrics endpoint not available:** Check application logs to ensure the Prometheus metrics server started correctly on `PROM_PORT`.

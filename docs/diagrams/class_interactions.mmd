@@ -1,0 +1,142 @@
+classDiagram
+    class MainEventLoop {
+        -active_processors: dict
+        -active_stream_tasks: dict
+        -shutdown_signal_event: Event
+        +handle_stream_event(event)
+        +manage_new_stream_creation(event)
+        +run_finalization_and_cleanup(processor, key)
+        +periodic_stale_stream_check()
+        +resume_stream_processing(stream_id)
+        +main()
+    }
+    
+    class StreamProcessor {
+        -stream_id: str
+        -file_path: Path
+        -s3_upload_id: str
+        -s3_bucket: str
+        -s3_key_prefix: str
+        -current_file_offset: int
+        -next_part_number: int
+        -uploaded_parts_info: list
+        -lock: Lock
+        +_initialize_from_checkpoint()
+        +process_file_write()
+        +finalize_stream()
+        +cancel_processing()
+    }
+    
+    class FileWatcher {
+        -_active_files_last_event_write: dict
+        +video_file_watcher(watch_dir, timeout, stop_event)
+    }
+    
+    class StreamEvent {
+        +change_type: WatcherChangeType
+        +file_path: Path
+    }
+    
+    class WatcherChangeType {
+        <<enumeration>>
+        CREATE
+        WRITE
+        DELETE
+        IDLE
+    }
+    
+    class RedisClient {
+        -_redis_pool: Redis
+        +get_redis_connection()
+        +close_redis_connection()
+        +init_stream_metadata()
+        +set_stream_status()
+        +get_stream_meta()
+        +get_stream_parts()
+        +set_stream_next_part()
+        +get_stream_next_part()
+        +add_stream_part_info()
+        +incr_stream_bytes_sent()
+        +get_stream_bytes_sent()
+        +update_stream_last_activity()
+        +get_active_stream_ids()
+        +get_pending_completion_stream_ids()
+        +move_stream_to_pending_completion()
+        +add_stream_to_completed_set()
+        +add_stream_to_failed_set()
+        +remove_stream_keys()
+    }
+    
+    class S3Client {
+        -_s3_session: Session
+        +get_s3_session()
+        +create_s3_multipart_upload()
+        +upload_s3_part()
+        +complete_s3_multipart_upload()
+        +abort_s3_multipart_upload()
+        +upload_json_to_s3()
+        +close_s3_resources()
+    }
+    
+    class MetadataGenerator {
+        +generate_metadata_json(stream_id, file_path)
+    }
+    
+    class FFprobeUtils {
+        +get_video_duration(file_path)
+    }
+    
+    class Settings {
+        +watch_dir: str
+        +chunk_size_bytes: int
+        +stream_timeout_seconds: int
+        +s3_*: various S3 settings
+        +redis_url: str
+        +ffprobe_path: str
+        +log_level: str
+        +app_env: str
+        +prom_port: int
+    }
+    
+    class ExceptionHierarchy {
+        CefMp4ProcessorError
+        ├── StreamInitializationError
+        ├── ChunkProcessingError
+        ├── StreamFinalizationError
+        ├── FFprobeError
+        ├── S3OperationError
+        └── RedisOperationError
+    }
+    
+    class PrometheusMetrics {
+        +VIDEO_CHUNKS_UPLOADED_TOTAL: Counter
+        +VIDEO_BYTES_UPLOADED_TOTAL: Counter
+        +VIDEO_STREAM_DURATION_SECONDS: Histogram
+        +VIDEO_PROCESSING_TIME_SECONDS: Histogram
+        +VIDEO_FAILED_OPERATIONS_TOTAL: Counter
+        +ACTIVE_STREAMS_GAUGE: Gauge
+        +STREAMS_COMPLETED_TOTAL: Counter
+        +STREAMS_FAILED_TOTAL: Counter
+        +start_metrics_server()
+    }
+    
+    MainEventLoop --> StreamProcessor : creates/manages
+    MainEventLoop --> FileWatcher : uses
+    MainEventLoop --> RedisClient : uses
+    MainEventLoop --> S3Client : uses
+    
+    StreamProcessor --> RedisClient : uses
+    StreamProcessor --> S3Client : uses
+    StreamProcessor --> MetadataGenerator : uses
+    StreamProcessor --> PrometheusMetrics : updates
+    
+    FileWatcher --> StreamEvent : yields
+    StreamEvent --> WatcherChangeType : contains
+    
+    MetadataGenerator --> RedisClient : uses
+    MetadataGenerator --> FFprobeUtils : uses
+    
+    Settings --> MainEventLoop : configures
+    Settings --> StreamProcessor : configures
+    Settings --> RedisClient : configures
+    Settings --> S3Client : configures 

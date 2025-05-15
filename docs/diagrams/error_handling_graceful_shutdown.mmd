@@ -1,0 +1,81 @@
+flowchart TD
+    subgraph "Error Handling"
+        error_start[Error Occurs] --> error_type{Error Type?}
+        
+        error_type -->|S3 Operation| s3_error[S3OperationError]
+        error_type -->|Redis Operation| redis_error[RedisOperationError]
+        error_type -->|Initialization| init_error[StreamInitializationError]
+        error_type -->|Chunk Processing| chunk_error[ChunkProcessingError]
+        error_type -->|Finalization| finalize_error[StreamFinalizationError]
+        error_type -->|FFprobe| ffprobe_error[FFprobeError]
+        
+        s3_error & redis_error & init_error & chunk_error & finalize_error & ffprobe_error --> retry{Retryable?}
+        
+        retry -->|Yes| retry_attempt{Max Retries?}
+        retry -->|No| handle_error[Handle Error]
+        
+        retry_attempt -->|Not Reached| retry_op[Retry Operation<br>with Backoff]
+        retry_attempt -->|Reached| handle_error
+        
+        retry_op -->|Succeeds| continue[Continue Processing]
+        retry_op -->|Fails Again| retry_attempt
+        
+        handle_error --> update_status[Update Stream Status<br>in Redis]
+        update_status --> metrics[Increment Error Metrics]
+        metrics --> log[Log Structured Error]
+        log --> stream_action{Stream Action?}
+        
+        stream_action -->|Mark Failed| failed[Mark Stream as Failed<br>in Redis]
+        stream_action -->|Abort Upload| abort[Abort S3 Multipart<br>Upload if Exists]
+        stream_action -->|Cleanup| remove_proc[Remove from<br>active_processors]
+    end
+    
+    subgraph "Graceful Shutdown"
+        shutdown_start[Shutdown Signal<br>Received] --> signal_handler[Signal Handler<br>Called]
+        
+        signal_handler --> set_event[Set shutdown_signal_event]
+        
+        set_event --> notify_tasks[Notify All Tasks]
+        
+        notify_tasks --> stop_watcher[Stop File Watcher]
+        notify_tasks --> stop_stale[Stop Stale Stream Checker]
+        notify_tasks --> cancel_tasks[Cancel Running Tasks]
+        
+        stop_watcher & stop_stale & cancel_tasks --> wait_tasks[Wait for Tasks<br>to Complete]
+        
+        wait_tasks --> processor_cleanup[Allow StreamProcessors<br>to Clean Up]
+        
+        processor_cleanup --> checkpoint[Save Checkpoint<br>State to Redis]
+        
+        checkpoint --> close_redis[Close Redis Connection]
+        checkpoint --> close_s3[Close S3 Resources]
+        
+        close_redis & close_s3 --> exit[Exit Application]
+    end
+    
+    subgraph "StreamProcessor Cancellation"
+        proc_cancel[StreamProcessor Task<br>Cancelled] --> catch_cancel[Catch CancelledError]
+        
+        catch_cancel --> check_state{Currently<br>Processing?}
+        
+        check_state -->|Yes| finish_chunk[Try to Finish<br>Current Chunk]
+        check_state -->|No| update_redis[Update Redis State]
+        
+        finish_chunk --> update_redis
+        
+        update_redis --> set_interrupted[Set Status to<br>interrupted_cancelled]
+        
+        set_interrupted --> propagate[Propagate Cancelled<br>Error]
+    end
+    
+    classDef error fill:#ffcccc,stroke:#e74c3c,stroke-width:2px
+    classDef process fill:#d5f5e3,stroke:#27ae60,stroke-width:2px
+    classDef decision fill:#fdebd0,stroke:#f39c12,stroke-width:2px
+    classDef start fill:#d6eaf8,stroke:#3498db,stroke-width:2px
+    classDef endpoint fill:#f5eef8,stroke:#8e44ad,stroke-width:2px
+    
+    class error_start,shutdown_start,proc_cancel start
+    class error_type,retry,retry_attempt,stream_action,check_state decision
+    class s3_error,redis_error,init_error,chunk_error,finalize_error,ffprobe_error error
+    class continue,exit,propagate endpoint
+    class handle_error,update_status,metrics,log,failed,abort,remove_proc,signal_handler,set_event,notify_tasks,stop_watcher,stop_stale,cancel_tasks,wait_tasks,processor_cleanup,checkpoint,close_redis,close_s3,catch_cancel,finish_chunk,update_redis,set_interrupted process

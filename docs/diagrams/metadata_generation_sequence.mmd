@@ -1,0 +1,58 @@
+sequenceDiagram
+    participant Processor as StreamProcessor
+    participant MetaGen as MetadataGenerator
+    participant FFprobe as FFprobeUtils
+    participant Redis as Redis
+    participant S3 as S3/MinIO
+    participant File as FileSystem
+    
+    Note over Processor: Stream finalization completed S3 upload
+    
+    Processor->>MetaGen: generate_metadata_json(stream_id, file_path)
+    activate MetaGen
+    
+    MetaGen->>Redis: get_stream_meta(stream_id)
+    Redis-->>MetaGen: Return stream metadata
+    
+    MetaGen->>Redis: get_stream_parts(stream_id)
+    Redis-->>MetaGen: Return all part information
+    
+    MetaGen->>FFprobe: get_video_duration(file_path)
+    activate FFprobe
+    
+    FFprobe->>FFprobe: Construct ffprobe command
+    FFprobe->>File: Create subprocess for ffprobe
+    File-->>FFprobe: Run ffprobe command
+    FFprobe->>File: Wait for completion
+    File-->>FFprobe: Return stdout (duration as string)
+    
+    alt FFprobe Error (Process Failed)
+        FFprobe-->>MetaGen: Raise FFprobeError
+        MetaGen-->>Processor: Return None (failed)
+    else FFprobe Success
+        FFprobe->>FFprobe: Parse duration as float
+        FFprobe-->>MetaGen: Return duration in seconds
+        deactivate FFprobe
+        
+        MetaGen->>MetaGen: Calculate total_size_bytes from parts
+        MetaGen->>MetaGen: Construct metadata JSON object
+        
+        MetaGen-->>Processor: Return metadata dictionary
+    end
+    deactivate MetaGen
+    
+    alt Metadata Generation Failed
+        Processor->>Redis: set_stream_status(stream_id, "failed_metadata_generation")
+    else Metadata Generation Succeeded
+        Processor->>S3: upload_json_to_s3(metadata_s3_key, metadata)
+        
+        alt S3 Upload Failed
+            Processor->>Redis: set_stream_status(stream_id, "failed_metadata_upload")
+        else S3 Upload Succeeded
+            Processor->>Redis: set_stream_status(stream_id, "completed")
+            Processor->>Redis: add_stream_to_completed_set(stream_id)
+            Processor->>Redis: remove_stream_keys(stream_id)
+        end
+    end
+    
+    Note over Processor: Metadata JSON format:<br>{<br>  "stream_id": "uuid",<br>  "original_file_path": "...",<br>  "s3_bucket": "...",<br>  "s3_key_prefix": "...",<br>  "total_size_bytes": 12345,<br>  "duration_seconds": 60.5,<br>  "processed_at_utc": "ISO datetime",<br>  "stream_started_at_utc": "ISO datetime",<br>  "stream_completed_at_utc": "ISO datetime",<br>  "chunks": [<br>    { "part_number": 1, "size_bytes": 10485760, "etag": "...", "uploaded_at_utc": "..." },<br>    ...<br>  ]<br>} 

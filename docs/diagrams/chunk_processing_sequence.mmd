@@ -1,0 +1,66 @@
+sequenceDiagram
+    participant Main as MainEventLoop
+    participant Processor as StreamProcessor
+    participant File as File System
+    participant S3 as S3/MinIO
+    participant Redis as Redis
+    participant Metrics as Metrics
+    
+    Note over Main: Receive WRITE event for existing file
+    
+    Main->>Main: handle_stream_event(WRITE)
+    Main->>Main: Lookup processor in active_processors[file_path]
+    Main->>Processor: process_file_write() (async task)
+    
+    activate Processor
+    Processor->>Processor: Acquire lock (prevent concurrent processing)
+    
+    Processor->>File: Check if file exists
+    
+    alt File Does Not Exist
+        Processor->>Processor: Log warning and exit
+    else File Exists
+        Processor->>File: Get file size (stat)
+        File-->>Processor: Return current size
+        
+        alt No New Data (size <= current_file_offset)
+            Processor->>Processor: Log debug and exit
+        else New Data Available
+            Processor->>Processor: Log processing start
+            
+            Processor->>File: Open file
+            Processor->>File: Seek to current_file_offset
+            
+            loop While Data Available
+                Processor->>File: Read chunk (chunk_size_bytes)
+                File-->>Processor: Return chunk data
+                
+                alt Chunk Empty (End of File)
+                    Processor->>Processor: Break loop
+                else Chunk Has Data
+                    Processor->>S3: upload_s3_part(bucket, key, upload_id, part_number, chunk)
+                    S3-->>Processor: Return part ETag
+                    
+                    alt Upload Failed
+                        Processor->>Processor: Log error and exit
+                    else Upload Succeeded
+                        Processor->>Processor: Store part info in uploaded_parts_info
+                        Processor->>Redis: add_stream_part_info(stream_id, part_number, etag, size)
+                        Processor->>Redis: incr_stream_bytes_sent(stream_id, chunk_size)
+                        Processor->>Redis: set_stream_next_part(stream_id, next_part_number + 1)
+                        Processor->>Redis: update_stream_last_activity(stream_id)
+                        
+                        Processor->>Processor: current_file_offset += chunk_size
+                        Processor->>Processor: next_part_number += 1
+                        
+                        Processor->>Metrics: VIDEO_CHUNKS_UPLOADED_TOTAL.inc()
+                        Processor->>Metrics: VIDEO_BYTES_UPLOADED_TOTAL.add(chunk_size)
+                    end
+                end
+            end
+            Processor->>File: Close file
+        end
+    end
+    
+    Processor->>Processor: Release lock
+    deactivate Processor 
