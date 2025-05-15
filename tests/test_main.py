@@ -94,12 +94,14 @@ async def test_manage_new_stream_creation_success(
     # Verify StreamProcessor constructor was called with the right parameters including shutdown_event
     assert MockStreamProcessor.call_count == 1
     sp_args, sp_kwargs = MockStreamProcessor.call_args
-    assert sp_kwargs.get("stream_id") == str(test_uuid)
-    assert sp_kwargs.get("file_path") == TEST_FILE_PATH
-    assert sp_kwargs.get("s3_upload_id") == mock_s3_upload_id
-    assert sp_kwargs.get("s3_bucket") == settings.s3_bucket_name
-    assert sp_kwargs.get("s3_key_prefix") == expected_s3_key_prefix
-    assert sp_kwargs.get("shutdown_event") == main.shutdown_signal_event
+    # Check that the positional arguments are correct
+    assert len(sp_args) >= 6  # Should have at least 6 positional arguments
+    assert sp_args[0] == str(test_uuid)
+    assert sp_args[1] == TEST_FILE_PATH
+    assert sp_args[2] == mock_s3_upload_id
+    assert sp_args[3] == settings.s3_bucket_name
+    assert sp_args[4] == expected_s3_key_prefix
+    assert sp_args[5] == main.shutdown_signal_event
 
     mock_processor_instance._initialize_from_checkpoint.assert_called_once()
 
@@ -165,6 +167,7 @@ async def test_handle_stream_event_write_processor_exists(
     mock_create_task: MagicMock, mock_stream_event_write: StreamEvent
 ):
     mock_processor = AsyncMock(spec=StreamProcessor)
+    mock_processor.stream_id = "test-stream-id"
     main.active_processors[TEST_FILE_PATH] = mock_processor
 
     # Create a mock event queue
@@ -172,12 +175,12 @@ async def test_handle_stream_event_write_processor_exists(
 
     await main.handle_stream_event(mock_stream_event_write, event_queue)
 
+    # Check that create_task was called
     mock_create_task.assert_called_once()
     # Check that processor.process_file_write was scheduled
     args, kwargs = mock_create_task.call_args
-    # args[0] is the coroutine, its __self__ should be the processor if it's a bound method
-    assert args[0].__self__ is mock_processor
-    assert args[0].__name__ == "process_file_write"
+    # args[0] is the coroutine passed to create_task
+    assert args[0].__name__ == "_create_and_manage_processor_task"
 
 
 @pytest.mark.asyncio
@@ -212,10 +215,9 @@ async def test_handle_stream_event_delete_processor_exists(
     await main.handle_stream_event(mock_stream_event_delete, event_queue)
 
     assert TEST_FILE_PATH not in main.active_processors
-    assert (
-        f"[{mock_processor.stream_id}] Removed processor for deleted file {TEST_FILE_NAME}."
-        in caplog.text
-    )
+    # Check for the log message with the JSON format
+    assert "Removed processor for deleted file" in caplog.text
+    assert "proc-to-delete" in caplog.text
     # TODO: Test task cancellation for the processor (Phase 8)
 
 
@@ -231,27 +233,35 @@ async def test_handle_stream_event_delete_processor_missing(
 
     await main.handle_stream_event(mock_stream_event_delete, event_queue)
 
-    assert f"[{TEST_FILE_NAME}] DELETE event for untracked file." in caplog.text
+    # Check for the log message with the JSON format
+    assert "DELETE event for untracked file" in caplog.text
+    assert TEST_FILE_PATH.as_posix() in caplog.text
 
 
 # Basic test for main() function structure - more complex scenarios are harder to unit test for main()
 @pytest.mark.asyncio
-@patch(
-    "src.main.video_file_watcher", new_callable=AsyncMock
-)  # Mock the watcher generator
 @patch("src.main.get_redis_connection", new_callable=AsyncMock)
 @patch("src.main.close_redis_connection", new_callable=AsyncMock)
 @patch("src.main.close_s3_resources", new_callable=AsyncMock)
 @patch("src.main.handle_stream_event", new_callable=AsyncMock)  # Mock event handler
+@patch("src.main.get_active_stream_ids", new_callable=AsyncMock)  # Mock Redis calls
+@patch(
+    "src.main.get_pending_completion_stream_ids", new_callable=AsyncMock
+)  # Mock Redis calls
 async def test_main_function_flow(
+    mock_get_pending_ids: AsyncMock,
+    mock_get_active_ids: AsyncMock,
     mock_handle_event: AsyncMock,
     mock_close_s3: AsyncMock,
     mock_close_redis: AsyncMock,
     mock_get_redis: AsyncMock,
-    mock_watcher: AsyncMock,
     setup_test_environment,  # Ensure settings.watch_dir is patched by fixture
 ):
-    # Simulate watcher yielding a few events then stopping (e.g., by raising StopAsyncIteration)
+    # Mock the active and pending stream IDs to be empty
+    mock_get_active_ids.return_value = []
+    mock_get_pending_ids.return_value = []
+
+    # Create events for testing
     event1 = StreamEvent(
         change_type=WatcherChangeType.CREATE, file_path=TEST_WATCH_DIR / "file1.mp4"
     )
@@ -259,39 +269,27 @@ async def test_main_function_flow(
         change_type=WatcherChangeType.WRITE, file_path=TEST_WATCH_DIR / "file1.mp4"
     )
 
-    # Make the mock_watcher an async generator that yields these events
+    # Create a patched version of the video_file_watcher function
+    # that yields our test events and then sets the shutdown signal
     async def mock_watcher_gen(*args, **kwargs):
         yield event1
         yield event2
-        # No StopAsyncIteration needed, exiting generator is enough
+        main.shutdown_signal_event.set()
 
-    mock_watcher.side_effect = mock_watcher_gen
+    # Apply the patch for the duration of this test
+    with patch("src.main.video_file_watcher", return_value=mock_watcher_gen()):
+        # Run main with a timeout
+        try:
+            await asyncio.wait_for(main.main(), timeout=2.0)
+        except asyncio.TimeoutError:
+            # This should not happen if our mock is working correctly
+            pass
 
-    # Run main, but use asyncio.wait_for to prevent it from running indefinitely if there's an issue.
-    # This is a simplified run; main() has its own KeyboardInterrupt handling.
-    try:
-        await asyncio.wait_for(main.main(), timeout=1.0)
-    except asyncio.TimeoutError:
-        # This might happen if the stop_event logic isn't hit correctly or watcher doesn't end.
-        # For this test, we expect it to finish if watcher ends.
-        pass
-        # If main() truly ran to completion via watcher ending, no TimeoutError.
-        # If watcher mock doesn't correctly stop the loop, it will timeout.
+    # Reset shutdown signal for other tests
+    main.shutdown_signal_event = asyncio.Event()
 
+    # Verify the expected calls were made
     mock_get_redis.assert_called_once()
-    assert mock_watcher.call_count == 1  # Watcher was iterated
-    # We can't easily check handle_stream_event calls with exact arguments
-    # since main() now puts events in a queue and processes them asynchronously
-    assert mock_handle_event.call_count > 0  # It should be called at least once
-
-    # Shutdown calls
+    mock_handle_event.assert_called()
     mock_close_redis.assert_called_once()
     mock_close_s3.assert_called_once()
-
-    # Check if watch_dir was created if it didn't exist (covered by main logic)
-    # For this test, the fixture ensures it exists.
-    # We can check if Path.mkdir was called if we mock Path.
-    # with patch.object(Path, 'mkdir') as mock_mkdir:
-    #    if not Path(settings.watch_dir).exists():
-    #        # Re-run main or part of it if necessary to test this path
-    #        pass # This path is tricky to hit if fixture always creates it
