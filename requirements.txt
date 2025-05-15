@@ -9,6 +9,7 @@ pydantic_settings
 watchfiles
 tenacity
 prometheus_client
+freezegun
 # Add other dependencies as identified, e.g., specific versions if necessary
 structlog # As planned for later phases, good to have for consistency if any stubs use it
 uvloop # Often used with asyncio for performance, optional but good practice

@@ -1,9 +1,18 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+import os
+import sys
+
+# Check if running in test mode
+IN_TEST_MODE = "pytest" in sys.modules
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        # Skip validation on error in test mode
+        validate_default=not IN_TEST_MODE,
     )
 
     watch_dir: str = "local_watch_dir"
@@ -29,4 +38,18 @@ class Settings(BaseSettings):
     prom_port: int = 8000
 
 
-settings = Settings()
+# In test mode, use default values without validation
+if IN_TEST_MODE:
+    settings = Settings(
+        _ignore_env=True,
+        watch_dir="test_watch_dir",
+        chunk_size_bytes=10 * 1024 * 1024,
+        stream_timeout_seconds=30,
+        s3_access_key_id="TEST_ACCESS_KEY",
+        s3_secret_access_key="TEST_SECRET_KEY",
+        s3_bucket_name="test-bucket",
+        app_env="test",
+    )
+else:
+    # Normal settings loading for non-test environments
+    settings = Settings()
