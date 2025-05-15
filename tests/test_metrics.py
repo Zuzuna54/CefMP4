@@ -107,28 +107,26 @@ def test_metrics_server_logging():
     mock_logger = MagicMock()
     mock_settings = MagicMock(prom_port=9090)
 
-    # Direct import to avoid circular dependencies
-    import sys
+    # Create a mock for prometheus_client that includes start_http_server
+    mock_prom_client = MagicMock()
+    mock_start_http = MagicMock()
+    mock_prom_client.start_http_server = mock_start_http
 
-    orig_prometheus_client = sys.modules["prometheus_client"]
-    sys.modules["prometheus_client"] = MagicMock()
+    # Using patch to replace imports
+    with (
+        patch("src.metrics.logger", mock_logger),
+        patch("src.metrics.settings", mock_settings),
+        patch("src.metrics.start_http_server", mock_start_http),
+    ):
+        # Import after patching
+        from src.metrics import start_metrics_server
 
-    try:
-        with (
-            patch("src.metrics.logger", mock_logger),
-            patch("src.metrics.settings", mock_settings),
-        ):
-            # Import after patching
-            from src.metrics import start_metrics_server
+        # Call the function
+        start_metrics_server()
 
-            # Call the function
-            start_metrics_server()
-
-            # Verify logger was called
-            mock_logger.info.assert_called_once()
-    finally:
-        # Restore the real prometheus_client
-        sys.modules["prometheus_client"] = orig_prometheus_client
+        # Verify logger was called
+        mock_logger.info.assert_called_once()
+        mock_start_http.assert_called_once_with(9090)
 
 
 def test_metrics_server_error_handling():

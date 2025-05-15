@@ -10,10 +10,10 @@ CefMP4 Stream Processor monitors a specified directory for MP4 video files. When
   - [Environment Variables](#environment-variables)
 - [Setup](#setup)
   - [1. Clone Repository](#1-clone-repository)
-  - [2. Docker Setup (Recommended for Services)](#2-docker-setup-recommended-for-services)
+  - [2. Docker Setup](#2-docker-setup)
   - [3. Local Development Setup (Python Virtual Environment)](#3-local-development-setup-python-virtual-environment)
 - [Running the Application](#running-the-application)
-  - [Using Docker (Application Container)](#using-docker-application-container)
+  - [Using Docker (Full Stack)](#using-docker-full-stack)
   - [Locally (Python Virtual Environment)](#locally-python-virtual-environment)
 - [How It Works](#how-it-works)
   - [Phase 1: Core Setup & Configuration](#phase-1-core-setup--configuration)
@@ -105,6 +105,35 @@ Configuration is managed via environment variables, loaded from an `.env` file u
 
 - `FFPROBE_PATH`: Optional: Full path to the `ffprobe` executable if not in system PATH.
 
+### Docker Environment Configuration
+
+When running with Docker Compose, environment variables are configured through the `.env` file, which is automatically loaded by Docker Compose. The application container and other services will use these settings.
+
+**Docker-specific considerations:**
+
+1. **Container Communication**: When running all services in Docker, use service names instead of `localhost`:
+
+   ```
+   S3_ENDPOINT_URL=http://minio:9000
+   REDIS_URL=redis://redis:6379/0
+   ```
+
+2. **Volume Mounts**: The `WATCH_DIR` setting should match the container path where your local directory is mounted.
+   In the default configuration, this is:
+
+   ```
+   WATCH_DIR=/app/local_watch_dir
+   ```
+
+   And the corresponding volume mount is defined in `docker-compose.yml`:
+
+   ```yaml
+   volumes:
+     - ./local_watch_dir:/app/local_watch_dir
+   ```
+
+3. **Default Settings**: The Docker setup in this project uses a default `.env` file with settings optimized for the Docker environment. If you make changes to these settings, ensure they are compatible with the Docker networking setup and container filesystem paths.
+
 ## Setup
 
 ### 1. Clone Repository
@@ -114,21 +143,160 @@ git clone <repository_url>
 cd CefMP4
 ```
 
-### 2. Docker Setup (Recommended for Services)
+### 2. Docker Setup
 
-This setup uses Docker Compose to run MinIO (S3) and Redis services.
+This project uses Docker Compose to orchestrate multiple containers working together:
 
-1.  Ensure Docker and Docker Compose are installed.
-2.  Start the services:
-    ```bash
-    docker compose up -d minio redis
-    ```
-    This will start MinIO and Redis in detached mode.
-    - MinIO will be accessible at `http://localhost:9000` (console at `http://localhost:9001`). Use credentials from your `.env` (default `minioadmin`/`minioadmin`).
-    - Redis will be accessible at `localhost:6379`.
-3.  You may need to manually create the S3 bucket specified in `S3_BUCKET_NAME` via the MinIO console if the application doesn't create it automatically (though it should attempt to).
+1. **MinIO**: An S3-compatible object storage service for storing video files and metadata
+2. **Redis**: For stream state management and checkpointing
+3. **Application**: The CefMP4 video processor itself
 
-### 3. Local Development Setup (Python Virtual Environment)
+#### Prerequisites
+
+- Docker and Docker Compose installed on your system
+- Git for cloning the repository
+
+#### Running the Complete Stack
+
+The easiest way to run the entire application is using Docker Compose:
+
+```bash
+# Create a local watch directory if it doesn't exist
+mkdir -p local_watch_dir
+
+# Copy example environment file (and modify as needed)
+cp example.env .env
+
+# Start all services (MinIO, Redis, and the application)
+docker compose up -d
+
+# To follow application logs
+docker compose logs -f app
+```
+
+This will:
+
+1. Start MinIO with web console available at http://localhost:9091 (credentials: minioadmin/minioadmin)
+2. Start Redis on port 6379
+3. Build and start the application container, which will watch the mounted `local_watch_dir`
+4. Expose the Prometheus metrics endpoint at http://localhost:8000/metrics
+
+#### Running Services Separately
+
+If you prefer to run just the supporting services (MinIO and Redis) and run the application locally:
+
+```bash
+# Start only MinIO and Redis
+docker compose up -d minio redis
+
+# Then run the application locally (in a separate terminal with your virtual env active)
+python src/main.py
+```
+
+#### Docker Compose Architecture
+
+The `docker-compose.yml` file defines the following services:
+
+- **app**: The main application container
+
+  - Built from the project's Dockerfile
+  - Mounts your local `local_watch_dir` to `/app/local_watch_dir` inside the container
+  - Connected to the same network as MinIO and Redis
+  - Environment variables loaded from `.env`
+  - Depends on MinIO and Redis services
+  - Has healthcheck configured to ensure proper operation
+
+- **minio**: S3-compatible object storage
+
+  - Uses the official MinIO Docker image
+  - Exposes API on port 9000 and web console on port 9091
+  - Persists data to `./minio_data` directory
+  - Has healthcheck configured
+  - Default credentials: minioadmin/minioadmin
+
+- **redis**: Key-value store for stream state management
+  - Uses the official Redis Docker image
+  - Exposes port 6379
+  - Has healthcheck configured
+  - Data is ephemeral (not persisted beyond container lifecycle by default)
+
+#### Docker Container Communication
+
+When running in Docker:
+
+- The application container references other services by their service names (`minio`, `redis`)
+- Your `.env` file should use these service names instead of `localhost`
+  - `S3_ENDPOINT_URL=http://minio:9000`
+  - `REDIS_URL=redis://redis:6379/0`
+
+#### Application Dockerfile Explained
+
+The application Dockerfile:
+
+1. Uses Python 3.11 as the base image
+2. Installs FFmpeg (for metadata generation) and other dependencies
+3. Creates a non-root user (`appuser`) for security best practices
+4. Sets up the application directory structure
+5. Copies and installs Python dependencies
+6. Exposes the metrics port
+7. Configures the entrypoint to run the application
+
+#### Testing Your Docker Setup
+
+1. Start the complete stack: `docker compose up -d`
+2. Verify all services are running: `docker compose ps`
+3. Check the logs to ensure proper startup: `docker compose logs -f`
+4. Open the MinIO console at http://localhost:9091
+   - Log in with default credentials (minioadmin/minioadmin)
+   - Verify the video-streams bucket exists (created automatically by the app)
+5. Copy an MP4 file to the `local_watch_dir` directory
+6. Watch the application logs to see processing activity: `docker compose logs -f app`
+7. Verify the processed file appears in MinIO under the video-streams bucket
+
+#### Troubleshooting Docker Setup
+
+- **Container fails to start**:
+
+  - Check logs: `docker compose logs app`
+  - Verify environment variables in `.env` are correct
+  - Ensure ports are not already in use on your system
+
+- **Application cannot connect to MinIO or Redis**:
+
+  - When running all services in Docker, ensure you're using service names (not localhost):
+    - `S3_ENDPOINT_URL=http://minio:9000`
+    - `REDIS_URL=redis://redis:6379/0`
+  - Check network connectivity: `docker compose exec app ping minio`
+
+- **Permission issues with watch directory**:
+
+  - The application runs as user `appuser` (UID 1001) inside the container
+  - Ensure your `local_watch_dir` has appropriate permissions: `chmod -R 777 local_watch_dir`
+
+- **Application not detecting files**:
+
+  - Docker mounting issues can sometimes cause file notification problems
+  - Try creating or copying files directly through the host filesystem
+  - For testing, you can enter the container and create files: `docker compose exec app touch /app/local_watch_dir/test.mp4`
+
+- **Bucket not created automatically**:
+
+  - Manually create the bucket in MinIO console with the name specified in `S3_BUCKET_NAME`
+  - Default is typically `video-streams`
+
+- **Container restarts repeatedly**:
+  - Check the Docker healthcheck status: `docker ps`
+  - Review logs for any errors: `docker compose logs app`
+
+## Running the Application
+
+### Using Docker (Full Stack)
+
+For the most consistent and hassle-free experience, use Docker Compose to run the entire stack as described in the [Docker Setup](#2-docker-setup) section above.
+
+This is the recommended approach for both production and development environments as it ensures all components are properly configured to work together.
+
+### Locally (Python Virtual Environment)
 
 For running the application directly on your host machine (connecting to Dockerized MinIO/Redis or other instances).
 
@@ -147,39 +315,15 @@ For running the application directly on your host machine (connecting to Dockeri
     ```bash
     mkdir -p local_watch_dir # Or the path you set in .env
     ```
-
-## Running the Application
-
-### Using Docker (Application Container)
-
-If you want to run the application itself in a Docker container (recommended for consistency with deployed environments):
-
-1.  Ensure MinIO and Redis services are running (see Docker Setup).
-2.  Update your `.env` file:
-    - Ensure `S3_ENDPOINT_URL` is accessible from within the Docker network (e.g., `http://minio:9000` if `minio` is the service name in `docker-compose.yml`).
-    - Ensure `REDIS_HOST` is accessible (e.g., `redis` if `redis` is the service name).
-3.  Build and run the application container along with the services:
-    ```bash
-    docker compose up --build app
+5.  Ensure your `.env` file has the correct connection parameters for MinIO and Redis (using `localhost` instead of service names):
     ```
-    Or, if services are already running:
-    ```bash
-    docker compose up --build -d app # To run in detached mode
-    docker compose logs -f app # To follow logs
+    S3_ENDPOINT_URL=http://localhost:9000
+    REDIS_URL=redis://localhost:6379/0
     ```
-
-### Locally (Python Virtual Environment)
-
-1.  Ensure MinIO and Redis services are running (e.g., via Docker Compose as described above, or other instances).
-2.  Ensure your `.env` file is configured correctly for these services (e.g., `S3_ENDPOINT_URL=http://localhost:9000`, `REDIS_HOST=localhost`).
-3.  Activate your virtual environment:
+6.  Run the application:
     ```bash
-    source .venv/bin/activate
+    python src/main.py
     ```
-4.  Run the application:
-    `bash
-python src/main.py
-`
     The application will start monitoring the `WATCH_DIR`. To trigger processing, copy an MP4 file into this directory.
 
 ## How It Works
@@ -288,6 +432,18 @@ The application processes video files in several stages, evolving through develo
     - `resume_stream_processing()`: A function called during application startup for each potentially resumable stream ID. It fetches metadata, instantiates a `StreamProcessor`, calls `_initialize_from_checkpoint()` on it, and then, based on the recovered stream status (e.g., "active", "pending_completion"), schedules the appropriate follow-up action (e.g., `processor.process_file_write()` to check for more data, or `processor.finalize_stream()` to attempt completion).
     - Startup Sequence: The main application startup logic first attempts to resume any interrupted streams before initiating new file watching or other periodic tasks.
   - Idempotency: Operations are designed to be idempotent where possible, or state checks are performed to prevent issues if an operation is re-tried during resume (e.g., not re-finalizing an already completed stream).
+- **Docker-specific Recovery Behavior**:
+  - When the application container restarts (e.g., due to a crash, system reboot, or manual restart), the checkpoint recovery system ensures no uploads are lost.
+  - Since Redis persists the state information outside the application container, streams in progress will be automatically detected and resumed.
+  - The recovery process works even if the original container was terminated unexpectedly, as long as:
+    1. The Redis data is preserved (Redis is running or its data was persisted)
+    2. The original source MP4 file is still available in the watched directory
+    3. The S3 server (MinIO) still has the partial upload data
+  - **Restart Testing**: You can test this recovery process by:
+    1. Starting the application with `docker compose up -d`
+    2. Copying a large MP4 file to the `local_watch_dir`
+    3. While the upload is in progress, restart just the application: `docker compose restart app`
+    4. Check the logs with `docker compose logs -f app` - you should see the application detect and resume the existing stream
 - **Diagrams**: [Checkpoint Recovery Sequence](docs/diagrams/checkpoint_recovery_sequence.mmd)
 
 ### Phase 8: Robust Error Handling & Graceful Shutdown
