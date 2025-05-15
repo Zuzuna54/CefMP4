@@ -1,15 +1,20 @@
-import logging
+import structlog
 import aioboto3
 from botocore.exceptions import ClientError
 from .config import settings
-import asyncio
 import json
-from contextlib import asynccontextmanager
+from .utils.retry import async_retry_transient
+from .exceptions import S3OperationError
 
-logger = logging.getLogger(__name__)  # To be replaced by structlog
+
+logger = structlog.get_logger(__name__)
 
 # Global S3 session
 _s3_session: aioboto3.Session | None = None
+
+# Define common transient S3 exceptions (subset of ClientError)
+# This is a simplification; in practice, you might inspect error codes.
+TRANSIENT_S3_EXCEPTIONS = (ClientError,)  # Or more specific ones if identifiable
 
 
 def get_s3_session() -> aioboto3.Session:
@@ -19,6 +24,7 @@ def get_s3_session() -> aioboto3.Session:
     return _s3_session
 
 
+@async_retry_transient(transient_exceptions=TRANSIENT_S3_EXCEPTIONS)
 async def create_s3_multipart_upload(bucket_name: str, object_key: str) -> str | None:
     session = get_s3_session()
     async with session.client(
@@ -42,17 +48,13 @@ async def create_s3_multipart_upload(bucket_name: str, object_key: str) -> str |
             )
             return upload_id
         except ClientError as e:
-            logger.error(
-                f"Error creating S3 multipart upload for {bucket_name}/{object_key}: {e}",
-                exc_info=True,
-            )
-            return None
+            err_msg = f"S3 ClientError creating multipart upload for {bucket_name}/{object_key}: {e}"
+            logger.error(err_msg, exc_info=True)
+            raise S3OperationError(operation="create_multipart_upload", message=str(e))
         except Exception as e:
-            logger.error(
-                f"Unexpected error during S3 multipart upload initiation for {bucket_name}/{object_key}: {e}",
-                exc_info=True,
-            )
-            return None
+            err_msg = f"Unexpected error during S3 multipart upload initiation for {bucket_name}/{object_key}: {e}"
+            logger.error(err_msg, exc_info=True)
+            raise S3OperationError(operation="create_multipart_upload", message=str(e))
 
 
 async def close_s3_resources():
@@ -65,6 +67,7 @@ async def close_s3_resources():
     pass
 
 
+@async_retry_transient(transient_exceptions=TRANSIENT_S3_EXCEPTIONS)
 async def upload_s3_part(
     bucket_name: str, object_key: str, upload_id: str, part_number: int, data: bytes
 ) -> str | None:
@@ -91,19 +94,16 @@ async def upload_s3_part(
             )
             return etag
         except ClientError as e:
-            logger.error(
-                f"Error uploading S3 part {part_number} for {object_key} (Upload ID: {upload_id}): {e}",
-                exc_info=True,
-            )
-            return None
+            err_msg = f"S3 ClientError uploading part {part_number} for {object_key} (Upload ID: {upload_id}): {e}"
+            logger.error(err_msg, exc_info=True)
+            raise S3OperationError(operation="upload_part", message=str(e))
         except Exception as e:
-            logger.error(
-                f"Unexpected error during S3 part upload for {object_key}, part {part_number}: {e}",
-                exc_info=True,
-            )
-            return None
+            err_msg = f"Unexpected error during S3 part upload for {object_key}, part {part_number}: {e}"
+            logger.error(err_msg, exc_info=True)
+            raise S3OperationError(operation="upload_part", message=str(e))
 
 
+@async_retry_transient(transient_exceptions=TRANSIENT_S3_EXCEPTIONS)
 async def complete_s3_multipart_upload(
     bucket_name: str, object_key: str, upload_id: str, parts: list[dict]
 ) -> bool:
@@ -153,19 +153,20 @@ async def complete_s3_multipart_upload(
             )
             return True
         except ClientError as e:
-            logger.error(
-                f"Error completing S3 multipart upload {upload_id} for {object_key}: {e}",
-                exc_info=True,
+            err_msg = f"S3 ClientError completing S3 multipart upload {upload_id} for {object_key}: {e}"
+            logger.error(err_msg, exc_info=True)
+            raise S3OperationError(
+                operation="complete_multipart_upload", message=str(e)
             )
-            return False
         except Exception as e:  # Catch any other unexpected errors
-            logger.error(
-                f"Unexpected error completing S3 multipart upload {upload_id} for {object_key}: {e}",
-                exc_info=True,
+            err_msg = f"Unexpected error completing S3 multipart upload {upload_id} for {object_key}: {e}"
+            logger.error(err_msg, exc_info=True)
+            raise S3OperationError(
+                operation="complete_multipart_upload", message=str(e)
             )
-            return False
 
 
+@async_retry_transient(transient_exceptions=TRANSIENT_S3_EXCEPTIONS)
 async def abort_s3_multipart_upload(
     bucket_name: str, object_key: str, upload_id: str
 ) -> bool:
@@ -189,19 +190,16 @@ async def abort_s3_multipart_upload(
             )
             return True
         except ClientError as e:
-            logger.error(
-                f"Error aborting S3 multipart upload {upload_id} for {object_key}: {e}",
-                exc_info=True,
-            )
-            return False
+            err_msg = f"S3 ClientError aborting S3 multipart upload {upload_id} for {object_key}: {e}"
+            logger.error(err_msg, exc_info=True)
+            raise S3OperationError(operation="abort_multipart_upload", message=str(e))
         except Exception as e:  # Catch any other unexpected errors
-            logger.error(
-                f"Unexpected error aborting S3 multipart upload {upload_id} for {object_key}: {e}",
-                exc_info=True,
-            )
-            return False
+            err_msg = f"Unexpected error aborting S3 multipart upload {upload_id} for {object_key}: {e}"
+            logger.error(err_msg, exc_info=True)
+            raise S3OperationError(operation="abort_multipart_upload", message=str(e))
 
 
+@async_retry_transient(transient_exceptions=TRANSIENT_S3_EXCEPTIONS)
 async def upload_s3_json_data(
     bucket_name: str, object_key: str, json_data_str: str
 ) -> bool:
@@ -210,14 +208,56 @@ async def upload_s3_json_data(
     return True  # Placeholder
 
 
+@async_retry_transient(transient_exceptions=TRANSIENT_S3_EXCEPTIONS)
 async def list_s3_parts(
     bucket_name: str, object_key: str, upload_id: str
 ) -> list[dict] | None:
-    logger.warning(f"[NOT IMPLEMENTED] list_s3_parts called for {object_key}")
-    # TODO: Implement in Phase 7 (Resume Logic)
-    return []  # Placeholder, return empty list
+    session = get_s3_session()
+    # For list_parts, pagination might be needed for very large number of parts.
+    # aioboto3's list_parts paginator can be used if this becomes an issue.
+    # For now, assume direct call is sufficient for typical video stream part counts.
+    async with session.client(
+        "s3",
+        endpoint_url=settings.s3_endpoint_url,
+        aws_access_key_id=settings.s3_access_key_id,
+        aws_secret_access_key=settings.s3_secret_access_key,
+        region_name=settings.s3_region_name,
+    ) as s3:
+        try:
+            response = await s3.list_parts(
+                Bucket=bucket_name, Key=object_key, UploadId=upload_id
+            )
+            parts = response.get("Parts", [])
+            # Ensure parts are in the format StreamProcessor expects: {'PartNumber': int, 'ETag': str, 'Size': int}
+            # The S3 response for list_parts already includes 'PartNumber', 'ETag', and 'Size'.
+            # We just need to ensure the keys are capitalized correctly if StreamProcessor expects that (it does).
+            formatted_parts = [
+                {"PartNumber": p["PartNumber"], "ETag": p["ETag"], "Size": p["Size"]}
+                for p in parts
+                if "PartNumber" in p and "ETag" in p and "Size" in p
+            ]
+            formatted_parts.sort(key=lambda x: x["PartNumber"])
+            logger.debug(
+                f"Listed {len(formatted_parts)} parts for {object_key}, UploadId: {upload_id}"
+            )
+            return formatted_parts
+        except ClientError as e:
+            logger.error(
+                f"Error listing S3 parts for {object_key}, UploadId {upload_id}: {e}",
+                exc_info=True,
+            )
+            # Not raising S3OperationError here to match previous behavior of returning None/[]
+            # This function is primarily used in resume logic, which might have its own way of handling failure to list parts.
+            return None  # Or an empty list as per previous implementation
+        except Exception as e:
+            logger.error(
+                f"Unexpected error listing S3 parts for {object_key}, UploadId {upload_id}: {e}",
+                exc_info=True,
+            )
+            return None
 
 
+@async_retry_transient(transient_exceptions=TRANSIENT_S3_EXCEPTIONS)
 async def upload_json_to_s3(bucket_name: str, object_key: str, data: dict) -> bool:
     session = get_s3_session()
     async with session.client(
@@ -240,16 +280,13 @@ async def upload_json_to_s3(bucket_name: str, object_key: str, data: dict) -> bo
             )
             return True
         except ClientError as e:
-            logger.error(
-                f"Error uploading JSON to S3 for {object_key}: {e}", exc_info=True
-            )
-            return False
+            err_msg = f"S3 ClientError uploading JSON to S3 for {object_key}: {e}"
+            logger.error(err_msg, exc_info=True)
+            raise S3OperationError(operation="upload_json_to_s3", message=str(e))
         except Exception as e:
-            logger.error(
-                f"Unexpected error during JSON S3 upload for {object_key}: {e}",
-                exc_info=True,
-            )
-            return False
+            err_msg = f"Unexpected error during JSON S3 upload for {object_key}: {e}"
+            logger.error(err_msg, exc_info=True)
+            raise S3OperationError(operation="upload_json_to_s3", message=str(e))
 
 
 # Other S3 functions (upload_part, complete_multipart_upload, etc.) will be added in later phases.

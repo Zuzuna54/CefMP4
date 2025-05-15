@@ -1,15 +1,13 @@
 import datetime
-import json
-import logging
+import structlog
 from pathlib import Path
 from src.utils.ffprobe_utils import get_video_duration
 from src.redis_client import (
     get_stream_meta,
     get_stream_parts,
 )  # Assuming get_stream_parts returns part details
-from src.config import settings
 
-logger = logging.getLogger(__name__)  # To be replaced by structlog
+logger = structlog.get_logger(__name__)
 
 
 async def generate_metadata_json(

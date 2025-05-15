@@ -1,9 +1,15 @@
 import asyncio
-import logging
+import structlog
 from pathlib import Path
 import uuid
 import signal
+import os
 import datetime
+from functools import partial
+
+from .logging_config import setup_logging
+
+setup_logging()
 
 from .config import settings
 from .watcher import video_file_watcher
@@ -16,644 +22,624 @@ from .redis_client import (
     get_pending_completion_stream_ids,
     get_stream_meta,
     move_stream_to_pending_completion,
-    remove_stream_from_active_set,
-    remove_stream_from_pending_completion,
     set_stream_status,
     update_stream_last_activity,
     add_stream_to_failed_set,
 )
 from .s3_client import create_s3_multipart_upload, close_s3_resources
 from .stream_processor import StreamProcessor
-
-# Basic logging setup for now, will be replaced by structlog in a later phase
-logging.basicConfig(
-    level=settings.log_level.upper(),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+from .exceptions import (
+    StreamInitializationError,
+    ChunkProcessingError,
+    StreamFinalizationError,
+    S3OperationError,
+    RedisOperationError,
 )
-logger = logging.getLogger(__name__)
+from .metrics import start_metrics_server, ACTIVE_STREAMS_GAUGE
+
+# Replace basicConfig if setup_logging handles everything
+# logging.basicConfig(
+#     level=settings.log_level.upper(),
+#     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+# )
+logger = structlog.get_logger(__name__)
 
 # Dictionary to keep track of active stream processors
 # Key: file_path (Path object), Value: StreamProcessor instance
 active_processors: dict[Path, StreamProcessor] = {}
+active_stream_tasks: dict[str, asyncio.Task] = {}
+
+shutdown_signal_event = asyncio.Event()
+
+MAX_CONCURRENT_STREAMS = int(os.getenv("MAX_CONCURRENT_STREAMS", "5"))
+stream_processing_semaphore = asyncio.Semaphore(MAX_CONCURRENT_STREAMS)
+
+
+def signal_handler(sig, frame):
+    logger.info(f"Signal {sig.name} received. Initiating graceful shutdown...")
+    shutdown_signal_event.set()
+
+
+async def _create_and_manage_processor_task(
+    processor_coro: asyncio.coroutines, stream_id: str, task_name: str
+):
+    """Helper to run processor coroutine with semaphore and manage task registration."""
+    async with stream_processing_semaphore:
+        if shutdown_signal_event.is_set():
+            logger.warning(
+                f"[{stream_id}] Shutdown in progress. Not starting new task: {task_name}"
+            )
+            return
+        try:
+            task = asyncio.create_task(processor_coro, name=task_name)
+            active_stream_tasks[stream_id] = task
+            await task
+        except asyncio.CancelledError:
+            logger.info(f"[{stream_id}] Task {task_name} was cancelled externally.")
+        except (
+            StreamInitializationError,
+            ChunkProcessingError,
+            StreamFinalizationError,
+        ) as e:
+            logger.error(
+                f"[{stream_id}] Stream processing error in task {task_name}: {e}",
+                exc_info=False,
+            )
+        except Exception as e:
+            logger.error(
+                f"[{stream_id}] Unexpected error in task {task_name}: {e}",
+                exc_info=True,
+            )
+            try:
+                await add_stream_to_failed_set(
+                    stream_id, reason="task_unexpected_error"
+                )
+            except Exception as redis_e:
+                logger.critical(
+                    f"[{stream_id}] CRITICAL: Failed to mark stream as failed in Redis after unexpected task error: {redis_e}"
+                )
+        finally:
+            active_stream_tasks.pop(stream_id, None)
+            logger.debug(
+                "Task completed and removed from active_stream_tasks.",
+                stream_id=stream_id,
+                task_name=task_name,
+            )
 
 
 async def manage_new_stream_creation(event: StreamEvent):
     """Handles the creation and registration of a new stream processor."""
     file_path = event.file_path
-    # Check if a processor for this file_path already exists.
-    # This simple check might need refinement if files can be rapidly replaced with the same name.
-    if file_path in active_processors:
-        # This could happen if CREATE events are emitted rapidly or if a previous processor wasn't cleaned up.
-        # For now, log and potentially re-initialize or ignore based on state.
-        # A more robust solution might involve checking the existing processor's stream_id against a new one
-        # or verifying its state in Redis if it's expected to be a replacement.
+    if file_path in active_processors and active_processors[file_path].stream_id:
         logger.warning(
-            f"[{file_path.name}] Received CREATE for an already tracked file path. Current processor stream ID: {active_processors[file_path].stream_id}. Re-evaluating or ignoring."
+            f"[{file_path.name}] Create event for already tracked path. Current processor stream ID: {active_processors[file_path].stream_id}. Ignoring."
         )
-        # For this phase, we'll overwrite if it exists, assuming the watcher detected a truly new file instance.
-        # A more sophisticated check would involve checking if the existing processor is still valid or if the underlying file has changed significantly (e.g. inode).
-        # If overwriting, ensure old processor is cleaned up if it had active tasks.
-        # For now, to keep Phase 4 focused, we'll proceed to create a new one, which might orphan the old one if not handled carefully in shutdown/cleanup.
-        # A better approach for Phase 4 might be to simply return if file_path in active_processors, and rely on DELETE/re-CREATE for replacements.
-        # Let's stick to the plan's intent: "if file_path in active_processors: ... return" (simplified for now)
-        # The plan stated: "For this phase, we keep it simple: one processor per file_path."
-        # However, the Phase 4 main.py had "if file_path in active_processors: ... return" which is safer.
-        # Let's stick with the safer return for now.``
-        # To allow re-processing if a file is deleted and re-added, we should remove it on DELETE.
-        # if file_path in active_processors:
-        #    logger.warning(f"Processor for {file_path} already exists. Ignoring new CREATE event.")
-        #    return
-        # The above was the original thought, but if a file is deleted then re-added, we DO want a new processor.
-        # The key is that active_processors should be cleaned up on DELETE or on processor completion/failure.
-        pass  # Allow creation, will overwrite if key exists. Cleanup of old one is an advanced topic.
+        return
 
     stream_id = str(uuid.uuid4())
     logger.info(
         f"[{file_path.name}] New stream detected (CREATE). Stream ID: {stream_id}"
     )
-
     s3_object_key_prefix = f"streams/{stream_id}/{file_path.name}"
 
     try:
         s3_upload_id = await create_s3_multipart_upload(
-            bucket_name=settings.s3_bucket_name, object_key=s3_object_key_prefix
+            settings.s3_bucket_name, s3_object_key_prefix
         )
         if not s3_upload_id:
             logger.error(
-                f"[{stream_id}] Failed to initiate S3 multipart upload for {file_path.name}. Aborting."
+                f"[{stream_id}] Failed to initiate S3 multipart upload (no S3UploadId returned). Aborting."
             )
             return
 
         await init_stream_metadata(
-            stream_id=stream_id,
-            file_path=str(file_path),
-            s3_upload_id=s3_upload_id,
-            s3_bucket=settings.s3_bucket_name,
-            s3_key_prefix=s3_object_key_prefix,
+            stream_id,
+            str(file_path),
+            s3_upload_id,
+            settings.s3_bucket_name,
+            s3_object_key_prefix,
         )
 
         processor = StreamProcessor(
-            stream_id=stream_id,
-            file_path=file_path,
-            s3_upload_id=s3_upload_id,
-            s3_bucket=settings.s3_bucket_name,
-            s3_key_prefix=s3_object_key_prefix,
+            stream_id,
+            file_path,
+            s3_upload_id,
+            settings.s3_bucket_name,
+            s3_object_key_prefix,
+            shutdown_signal_event,
         )
-        await processor._initialize_from_checkpoint()  # For consistency, though likely no checkpoint for new stream
-
+        await processor._initialize_from_checkpoint()
         active_processors[file_path] = processor
+        ACTIVE_STREAMS_GAUGE.inc()
         logger.info(
-            f"[{stream_id}] StreamProcessor created and registered for {file_path.name}."
+            "StreamProcessor created.", stream_id=stream_id, file_path=str(file_path)
         )
 
-        # Initial data might exist, so trigger a process_file_write immediately after creation.
+        initial_processing_coro = processor.process_file_write()
         asyncio.create_task(
-            processor.process_file_write(), name=f"initial_write_{stream_id[:8]}"
+            _create_and_manage_processor_task(
+                initial_processing_coro, stream_id, f"initial_write_{stream_id[:8]}"
+            )
         )
 
-    except Exception as e:
+    except (S3OperationError, RedisOperationError, StreamInitializationError) as e:
         logger.error(
-            f"[{stream_id}] Error during new stream setup for {file_path.name}: {e}",
-            exc_info=True,
+            "Error during new stream setup",
+            stream_id=stream_id,
+            file_path=str(file_path),
+            exc_info=e,
         )
-        # Cleanup for S3/Redis for failed init is for Phase 8.
+        if stream_id:
+            try:
+                await add_stream_to_failed_set(
+                    stream_id, reason="new_stream_unexpected_setup_failure"
+                )
+            except Exception:
+                pass
 
 
-async def handle_stream_event(event: StreamEvent):
+async def handle_stream_event(event: StreamEvent, event_queue: asyncio.Queue):
     logger.debug(
         f"Received event: Type={event.change_type.name}, Path={event.file_path}"
     )
+    if shutdown_signal_event.is_set():
+        logger.info(
+            f"Shutdown in progress, not processing new event: {event.change_type.name} for {event.file_path}"
+        )
+        return
 
     if event.change_type == WatcherChangeType.CREATE:
-        asyncio.create_task(
-            manage_new_stream_creation(event),
-            name=f"manage_create_{event.file_path.name}",
-        )
+        asyncio.create_task(manage_new_stream_creation(event))
 
     elif event.change_type == WatcherChangeType.WRITE:
         processor = active_processors.get(event.file_path)
         if processor:
+            processing_coro = processor.process_file_write()
             asyncio.create_task(
-                processor.process_file_write(),
-                name=f"process_write_{processor.stream_id[:8]}",
+                _create_and_manage_processor_task(
+                    processing_coro,
+                    processor.stream_id,
+                    f"process_write_{processor.stream_id[:8]}",
+                )
             )
         else:
             logger.warning(
-                f"[{event.file_path.name}] WRITE event for untracked file. Was CREATE missed or file appeared suddenly?"
+                f"[{event.file_path.name}] WRITE event for untracked file. Re-queueing as CREATE."
             )
-            # As per Phase 4 plan, watcher should emit CREATE first if file was new then modified.
-            # If this still happens, could re-evaluate or trigger CREATE flow. For now, just log.
+            new_event = StreamEvent(
+                change_type=WatcherChangeType.CREATE, file_path=event.file_path
+            )
+            await event_queue.put(new_event)
 
     elif event.change_type == WatcherChangeType.DELETE:
-        logger.info(f"[{event.file_path.name}] DELETE event received.")
+        logger.info("DELETE event received.", file_path=str(event.file_path))
         processor = active_processors.pop(event.file_path, None)
         if processor:
+            ACTIVE_STREAMS_GAUGE.dec()
             logger.info(
-                f"[{processor.stream_id}] Removed processor for deleted file {event.file_path.name}."
+                "Removed processor for deleted file. Signalling task to cancel if active.",
+                stream_id=processor.stream_id,
             )
-            # TODO: Add cancellation of ongoing tasks for this processor if any (Phase 8)
-            # processor.cancel_processing() # Hypothetical method
+            task = active_stream_tasks.get(processor.stream_id)
+            if task and not task.done():
+                task.cancel()
+            try:
+                await set_stream_status(processor.stream_id, "deleted_locally")
+            except Exception as e:
+                logger.warning(
+                    f"[{processor.stream_id}] Failed to set status to deleted_locally: {e}"
+                )
         else:
-            logger.warning(f"[{event.file_path.name}] DELETE event for untracked file.")
-
-    # IDLE events handled by stale stream checker (Phase 5)
+            logger.warning(
+                "DELETE event for untracked file.", file_path=str(event.file_path)
+            )
 
 
 async def run_finalization_and_cleanup(processor: StreamProcessor, processor_key: Path):
-    """Helper to run finalization and then remove processor from active_processors."""
     try:
         logger.info(
             f"[{processor.stream_id}] Attempting to finalize stream for {processor.file_path} via helper."
         )
-        await processor.finalize_stream()
-    except Exception as e_finalize:
+        finalization_coro = processor.finalize_stream()
+        await _create_and_manage_processor_task(
+            finalization_coro,
+            processor.stream_id,
+            f"finalize_stream_{processor.stream_id[:8]}",
+        )
+    except Exception as e_finalize_wrapper:
         logger.error(
-            f"[{processor.stream_id}] Error during finalization task for {processor.file_path}: {e_finalize}",
+            f"[{processor.stream_id}] Error in finalization task wrapper for {processor.file_path}: {e_finalize_wrapper}",
             exc_info=True,
         )
-        # Stream status should already be set to a failed state by finalize_stream itself
     finally:
-        # Remove the processor from active tracking after finalization attempt
-        # Check if the processor at that key is still the same one we intended to finalize
         if (
             processor_key in active_processors
-            and active_processors[processor_key].stream_id == processor.stream_id
+            and active_processors.get(processor_key) == processor
         ):
             del active_processors[processor_key]
+            ACTIVE_STREAMS_GAUGE.dec()
             logger.info(
-                f"[{processor.stream_id}] Processor for {processor.file_path} removed from active tracking after finalization attempt."
-            )
-        else:
-            # This could happen if the processor was already removed, or replaced (e.g. file deleted and re-added quickly)
-            logger.warning(
-                f"[{processor.stream_id}] Processor for {processor.file_path} (key: {processor_key}) not found or stream_id mismatch during cleanup. Current in dict for key: {active_processors.get(processor_key)}"
+                "Processor removed from active_processors after finalization attempt.",
+                stream_id=processor.stream_id,
             )
 
 
-async def periodic_stale_stream_check(stop_event: asyncio.Event):
-    """Periodically checks for streams that have become idle."""
-    global active_processors  # Allow modification of the global active_processors dict
-    while not stop_event.is_set():
+async def periodic_stale_stream_check():
+    while not shutdown_signal_event.is_set():
         try:
             logger.debug("Running periodic stale stream check...")
-            active_stream_ids_in_redis = await get_active_stream_ids()
-            now = datetime.datetime.now(datetime.timezone.utc)
+            active_redis_stream_ids = await get_active_stream_ids()
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
 
-            for stream_id in active_stream_ids_in_redis:
+            for stream_id in active_redis_stream_ids:
+                if shutdown_signal_event.is_set():
+                    break
                 meta = await get_stream_meta(stream_id)
-                if (
-                    meta
-                    and meta.get("last_activity_at_utc")
-                    and meta.get("status") == "active"
-                ):  # Process only if status is active
-                    try:
-                        last_activity_str = meta["last_activity_at_utc"]
-                        last_activity_dt = datetime.datetime.fromisoformat(
-                            last_activity_str
-                        )
+                if not meta or meta.get("status") != "active":
+                    continue
 
-                        if (
-                            last_activity_dt.tzinfo is None
-                        ):  # Ensure offset-aware for comparison
-                            last_activity_dt = last_activity_dt.replace(
-                                tzinfo=datetime.timezone.utc
-                            )
-
-                        if (
-                            now - last_activity_dt
-                        ).total_seconds() > settings.stream_timeout_seconds:
-                            logger.info(
-                                f"Stream {stream_id} is idle by last_activity: {last_activity_str}. Checking if fully processed..."
-                            )
-
-                            file_path_str = meta.get("original_path")
-                            total_bytes_sent_str = meta.get("total_bytes_sent")
-                            total_bytes_sent = (
-                                int(total_bytes_sent_str)
-                                if total_bytes_sent_str
-                                and total_bytes_sent_str.isdigit()
-                                else 0
-                            )
-
-                            if not file_path_str:
-                                logger.warning(
-                                    f"Stream {stream_id} is idle but has no original_path in metadata. Cannot verify disk size. Skipping finalization attempt for now."
-                                )
-                                # Potentially move to an error state or log for investigation
-                                continue
-
-                            p_file_path = Path(file_path_str)
-                            try:
-                                disk_file_size = p_file_path.stat().st_size
-                            except FileNotFoundError:
-                                logger.warning(
-                                    f"Stale stream {stream_id} original file {p_file_path} NOT FOUND. Aborting S3 upload if possible."
-                                )
-                                s3_upload_id = meta.get("s3_upload_id")
-                                s3_bucket = meta.get("s3_bucket")
-                                s3_key_prefix = meta.get("s3_key_prefix")
-                                if s3_upload_id:  # Abort S3 upload
-                                    from src.s3_client import (
-                                        abort_s3_multipart_upload,
-                                    )  # Local import
-
-                                    await abort_s3_multipart_upload(
-                                        s3_bucket, s3_key_prefix, s3_upload_id
-                                    )
-                                await set_stream_status(
-                                    stream_id, "failed_file_missing"
-                                )  # Update Redis status
-                                await remove_stream_from_pending_completion(
-                                    stream_id
-                                )  # Clean up from this set if it was moved
-                                await remove_stream_from_active_set(
-                                    stream_id
-                                )  # Also remove from active set
-                                # Remove from in-memory active_processors if it exists
-                                if (
-                                    p_file_path in active_processors
-                                    and active_processors[p_file_path].stream_id
-                                    == stream_id
-                                ):
-                                    del active_processors[p_file_path]
-                                    logger.info(
-                                        f"[{stream_id}] Processor for missing file {p_file_path} removed from active tracking."
-                                    )
-                                continue  # Move to next stream
-
-                            if total_bytes_sent == disk_file_size:
-                                logger.info(
-                                    f"Stream {stream_id} confirmed STALE and FULLY PROCESSED (processed: {total_bytes_sent}, disk: {disk_file_size}). Proceeding with finalization."
-                                )
-                                # Existing finalization logic (get processor or create temp_processor, then finalize)
-                                s3_upload_id = meta.get(
-                                    "s3_upload_id"
-                                )  # Re-fetch for temp_processor case
-                                s3_bucket = meta.get("s3_bucket")
-                                s3_key_prefix = meta.get("s3_key_prefix")
-                                processor = active_processors.get(p_file_path)
-
-                                if processor and processor.stream_id == stream_id:
-                                    logger.info(
-                                        f"[{stream_id}] Found active processor for stale stream. Moving to pending_completion and scheduling finalization."
-                                    )
-                                    await move_stream_to_pending_completion(stream_id)
-                                    asyncio.create_task(
-                                        run_finalization_and_cleanup(
-                                            processor, p_file_path
-                                        ),
-                                        name=f"idle_finalize_{stream_id[:8]}",
-                                    )
-                                elif (
-                                    processor
-                                ):  # Processor for path exists, but different stream_id
-                                    logger.warning(
-                                        f"Stale stream {stream_id} for path {p_file_path}, but existing processor has different ID ({processor.stream_id}). Stale check won't finalize this specific processor instance via this path."
-                                    )
-                                else:  # No processor in memory, reconstruct temp one
-                                    logger.warning(
-                                        f"Stale stream {stream_id} (path: {p_file_path}) is active in Redis but no in-memory processor found. Reconstructing temporary processor for finalization."
-                                    )
-                                    if s3_upload_id and s3_bucket and s3_key_prefix:
-                                        temp_processor = StreamProcessor(
-                                            stream_id=stream_id,
-                                            file_path=p_file_path,
-                                            s3_upload_id=s3_upload_id,
-                                            s3_bucket=s3_bucket,
-                                            s3_key_prefix=s3_key_prefix,
-                                        )
-                                        await temp_processor._initialize_from_checkpoint()
-                                        await move_stream_to_pending_completion(
-                                            stream_id
-                                        )
-                                        asyncio.create_task(
-                                            temp_processor.finalize_stream(),
-                                            name=f"idle_temp_finalize_{stream_id[:8]}",
-                                        )
-                                    else:
-                                        logger.error(
-                                            f"Stale stream {stream_id} (path: {p_file_path}) has insufficient metadata to reconstruct for finalization. Manual intervention likely needed."
-                                        )
-                            elif total_bytes_sent < disk_file_size:
-                                logger.warning(
-                                    f"Stream {stream_id} is idle by last_activity, but disk file size ({disk_file_size}) > processed bytes ({total_bytes_sent}). File may still be growing or processing lagged. Re-triggering processing and updating last_activity."
-                                )
-                                await update_stream_last_activity(
-                                    stream_id
-                                )  # Update to reset idle timer for the next check
-
-                                # Proactively schedule another processing pass
-                                processor = active_processors.get(p_file_path)
-                                if processor and processor.stream_id == stream_id:
-                                    if (
-                                        not processor.is_processing
-                                    ):  # Optional: check if already processing from another trigger
-                                        logger.info(
-                                            f"[{stream_id}] Stale checker re-triggering process_file_write for path {p_file_path}."
-                                        )
-                                        asyncio.create_task(
-                                            processor.process_file_write(),
-                                            name=f"stale_reprocess_{stream_id[:8]}",
-                                        )
-                                    else:
-                                        logger.info(
-                                            f"[{stream_id}] Stale checker sees pending processing for path {p_file_path}, not re-triggering immediately."
-                                        )
-                                elif (
-                                    processor
-                                ):  # Processor for path exists, different stream_id
-                                    logger.warning(
-                                        f"Stream {stream_id} needs reprocessing for path {p_file_path}, but existing processor has different ID ({processor.stream_id}). Cannot re-trigger."
-                                    )
-                                else:  # No processor in memory - this case is complex, _initialize_from_checkpoint would be needed for a new one
-                                    logger.warning(
-                                        f"Stream {stream_id} needs reprocessing for path {p_file_path}, but no active processor found. A new processor would need to be created and initialized from checkpoint."
-                                    )
-                                    # For Phase 5, we primarily focus on existing processors. Phase 7 (Resume) would handle creating new ones robustly.
-
-                            else:  # total_bytes_sent > disk_file_size (file truncated?)
-                                logger.error(
-                                    f"Stream {stream_id} is idle by last_activity, but processed bytes ({total_bytes_sent}) > disk file size ({disk_file_size}). File may have been truncated. Aborting S3 upload."
-                                )
-                                s3_upload_id = meta.get("s3_upload_id")
-                                s3_bucket = meta.get("s3_bucket")
-                                s3_key_prefix = meta.get("s3_key_prefix")
-                                if s3_upload_id:  # Abort S3 upload
-                                    from src.s3_client import (
-                                        abort_s3_multipart_upload,
-                                    )  # Local import
-
-                                    await abort_s3_multipart_upload(
-                                        s3_bucket, s3_key_prefix, s3_upload_id
-                                    )
-                                await set_stream_status(
-                                    stream_id, "failed_file_truncated"
-                                )  # New status, if we want to track this state
-                                await remove_stream_from_pending_completion(stream_id)
-                                await remove_stream_from_active_set(stream_id)
-                                if (
-                                    p_file_path in active_processors
-                                    and active_processors[p_file_path].stream_id
-                                    == stream_id
-                                ):
-                                    del active_processors[p_file_path]
-                                    logger.info(
-                                        f"[{stream_id}] Processor for truncated file {p_file_path} removed from active tracking."
-                                    )
-                    except ValueError as ve:
-                        logger.error(
-                            f"Error parsing last_activity_at_utc for stream {stream_id}: {meta.get('last_activity_at_utc')} - {ve}"
-                        )
-                    except Exception as e_inner:
-                        logger.error(
-                            f"Error processing stale check for stream {stream_id}: {e_inner}",
-                            exc_info=True,
-                        )
-                elif meta and meta.get("status") != "active":
-                    logger.debug(
-                        f"Stream {stream_id} found by stale checker but status is '{meta.get("status")}'. Skipping idle check."
-                    )
-                elif meta:
-                    logger.warning(
-                        f"Stream {stream_id} is active but has no 'last_activity_at_utc' in meta. Updating last activity to now."
-                    )
+                last_activity_str = meta.get("last_activity_at_utc")
+                if not last_activity_str:
                     await update_stream_last_activity(stream_id)
-                # If meta is None, stream_id was in active set but key stream:<id>:meta disappeared. Could log this.
+                    continue
+
+                last_activity_dt = datetime.datetime.fromisoformat(last_activity_str)
+                if last_activity_dt.tzinfo is None:
+                    last_activity_dt = last_activity_dt.replace(
+                        tzinfo=datetime.timezone.utc
+                    )
+
+                if (
+                    now_utc - last_activity_dt
+                ).total_seconds() > settings.stream_timeout_seconds:
+                    logger.info(
+                        f"[{stream_id}] Stream is STALE by last_activity: {last_activity_str}. Checking for completion."
+                    )
+                    file_path_str = meta.get("original_path")
+                    if not file_path_str:
+                        await add_stream_to_failed_set(stream_id, "stale_no_path")
+                        continue
+
+                    p_file_path = Path(file_path_str)
+                    processor = active_processors.get(p_file_path)
+
+                    if not p_file_path.exists():
+                        logger.warning(
+                            f"[{stream_id}] Stale stream original file {p_file_path} NOT FOUND. Aborting S3 (if processor known) & marking failed."
+                        )
+                        if processor and processor.s3_upload_id:
+                            from .s3_client import abort_s3_multipart_upload
+
+                            await abort_s3_multipart_upload(
+                                processor.s3_bucket,
+                                processor.s3_key_prefix,
+                                processor.s3_upload_id,
+                            )
+                        await add_stream_to_failed_set(stream_id, "stale_file_missing")
+                        if processor:
+                            active_processors.pop(p_file_path, None)
+                            ACTIVE_STREAMS_GAUGE.dec()
+                        continue
+
+                    disk_file_size = p_file_path.stat().st_size
+                    total_bytes_sent = int(meta.get("total_bytes_sent", 0))
+
+                    if total_bytes_sent >= disk_file_size:
+                        logger.info(
+                            f"[{stream_id}] Stale stream appears fully uploaded (sent: {total_bytes_sent}, disk: {disk_file_size}). Moving to pending completion."
+                        )
+                        if processor and processor.stream_id == stream_id:
+                            await move_stream_to_pending_completion(stream_id)
+                            asyncio.create_task(
+                                run_finalization_and_cleanup(processor, p_file_path)
+                            )
+                        elif processor:
+                            logger.warning(
+                                f"[{stream_id}] Stale stream {stream_id} found processor for path {p_file_path}, but stream ID mismatch ({processor.stream_id}). Orphaned? Marking failed."
+                            )
+                            await add_stream_to_failed_set(
+                                stream_id, "stale_processor_mismatch"
+                            )
+                        else:
+                            logger.warning(
+                                f"[{stream_id}] Stale stream {stream_id} for {p_file_path} is fully uploaded but has no active processor. Attempting to resume for finalization."
+                            )
+                            asyncio.create_task(
+                                resume_stream_processing(
+                                    stream_id, for_finalization_only=True
+                                )
+                            )
+                    else:
+                        logger.info(
+                            f"[{stream_id}] Stale stream data on disk ({disk_file_size}) > sent ({total_bytes_sent}). Re-triggering write processing."
+                        )
+                        if processor and processor.stream_id == stream_id:
+                            processing_coro = processor.process_file_write()
+                            asyncio.create_task(
+                                _create_and_manage_processor_task(
+                                    processing_coro,
+                                    stream_id,
+                                    f"stale_reprocess_{stream_id[:8]}",
+                                )
+                            )
+                        else:
+                            logger.warning(
+                                f"[{stream_id}] Stale stream needs reprocessing for {p_file_path}, but no matching processor. Resuming."
+                            )
+                            asyncio.create_task(resume_stream_processing(stream_id))
 
             await asyncio.sleep(
                 settings.stream_timeout_seconds / 2
-            )  # Or a fixed sensible interval e.g. 10-15s
+                if settings.stream_timeout_seconds > 2
+                else 1
+            )
+
+        except (RedisOperationError, S3OperationError) as e:
+            logger.error(
+                f"Client error in periodic_stale_stream_check: {e}", exc_info=False
+            )
+            await asyncio.sleep(settings.stream_timeout_seconds)
         except asyncio.CancelledError:
             logger.info("Periodic stale stream checker task cancelled.")
             break
         except Exception as e:
-            logger.error(
-                f"Critical error in periodic_stale_stream_check loop: {e}",
-                exc_info=True,
-            )
-            await asyncio.sleep(
-                settings.stream_timeout_seconds
-            )  # Avoid fast error loop
+            logger.error(f"Error in periodic_stale_stream_check: {e}", exc_info=True)
+            await asyncio.sleep(settings.stream_timeout_seconds)
 
 
-async def resume_stream_processing(stream_id: str):
+async def resume_stream_processing(stream_id: str, for_finalization_only: bool = False):
     logger.info(f"Attempting to resume processing for stream_id: {stream_id}")
-    # Ensure add_stream_to_failed_set is available if needed for error cases
-    from .redis_client import add_stream_to_failed_set
-
     meta = await get_stream_meta(stream_id)
     if not meta:
-        logger.error(
-            f"No metadata found for stream_id: {stream_id} during resume. Skipping."
-        )
-        # Consider marking as failed if appropriate, e.g., if it was in an active set but meta disappeared
-        # await add_stream_to_failed_set(stream_id, "meta_missing_on_resume")
+        logger.error(f"No metadata for stream_id: {stream_id} during resume. Skipping.")
+        await add_stream_to_failed_set(stream_id, "resume_no_meta")
         return
 
     file_path_str = meta.get("original_path")
     s3_upload_id = meta.get("s3_upload_id")
     s3_bucket = meta.get("s3_bucket")
     s3_key_prefix = meta.get("s3_key_prefix")
-    status = meta.get("status")
+    status = meta.get("status", "unknown")
 
     if not all([file_path_str, s3_upload_id, s3_bucket, s3_key_prefix]):
         logger.error(
-            f"Incomplete metadata for stream_id: {stream_id} during resume. Skipping. Meta: {meta}"
+            f"Incomplete metadata for stream_id: {stream_id} during resume. Meta: {meta}"
         )
-        await add_stream_to_failed_set(stream_id, "incomplete_meta_on_resume")
+        await add_stream_to_failed_set(stream_id, "resume_incomplete_meta")
         return
 
     file_path = Path(file_path_str)
-
-    # Prevent re-adding if a processor for this path already exists from another resumed stream_id
-    # This is a simple check; more complex scenarios (e.g. same file, different stream_id if not cleaned up) might need more logic
     if file_path in active_processors:
         logger.warning(
-            f"Processor for {file_path} (from stream {active_processors[file_path].stream_id}) already exists. Skipping resume for stream {stream_id} to avoid conflict."
+            "Processor for file already exists. Skipping resume action.",
+            stream_id=stream_id,
+            file_path=str(file_path),
         )
-        # This might indicate an issue with cleanup or multiple stream_ids pointing to the same file.
         return
 
     processor = StreamProcessor(
-        stream_id, file_path, s3_upload_id, s3_bucket, s3_key_prefix
+        stream_id,
+        file_path,
+        s3_upload_id,
+        s3_bucket,
+        s3_key_prefix,
+        shutdown_signal_event,
     )
     try:
         await processor._initialize_from_checkpoint()
     except FileNotFoundError:
         logger.error(
-            f"Failed to initialize processor for stream {stream_id} due to missing file: {file_path}. Stream already marked as failed by _initialize_from_checkpoint."
+            f"Resume failed for stream {stream_id}: original file {file_path} not found. Already marked failed by init."
         )
-        # _initialize_from_checkpoint should have already called add_stream_to_failed_set
         return
-    except Exception as e_init:
+    except StreamInitializationError as e_init:
         logger.error(
-            f"Failed to initialize processor for stream {stream_id} from checkpoint: {e_init}",
+            f"Resume failed for stream {stream_id}: init error {e_init}. Already marked failed by init."
+        )
+        return
+    except Exception as e_init_unexpected:
+        logger.error(
+            f"Resume failed for stream {stream_id}: unexpected init error {e_init_unexpected}",
             exc_info=True,
         )
-        await add_stream_to_failed_set(stream_id, "init_checkpoint_failed_on_resume")
+        await add_stream_to_failed_set(
+            stream_id, reason="resume_init_unexpected_failure"
+        )
         return
 
-    active_processors[file_path] = processor  # Use Path object as key
+    active_processors[file_path] = processor
+    ACTIVE_STREAMS_GAUGE.inc()
+    logger.info(
+        "Processor resumed.",
+        stream_id=stream_id,
+        file_path=str(file_path),
+        status=status,
+    )
 
+    task_coro = None
+    task_name_suffix = ""
     if (
-        status == "pending_completion"
-        or status == "s3_completed"
-        or status == "failed_metadata_generation"
-        or status == "failed_metadata_upload"
+        status
+        in [
+            "pending_completion",
+            "s3_completed",
+            "failed_meta_upload",
+            "failed_meta_generation",
+        ]
+        or for_finalization_only
     ):
-        logger.info(
-            f"[{stream_id}] Resuming: stream status '{status}'. Triggering finalize_stream."
-        )
-        asyncio.create_task(
-            run_finalization_and_cleanup(processor, file_path),
-            name=f"resume_finalize_{stream_id[:8]}",
-        )
+        logger.info(f"[{stream_id}] Resuming: Triggering finalize_stream.")
+        task_coro = processor.finalize_stream()
+        task_name_suffix = f"resume_finalize_{stream_id[:8]}"
     elif (
-        status == "active" or status == "processing" or status is None
-    ):  # 'processing' was old, 'active' is current
+        status
+        in [
+            "active",
+            "processing",
+            "interrupted_shutdown_write",
+            "interrupted_cancelled_write",
+            "unknown",
+        ]
+        and not for_finalization_only
+    ):
+        logger.info(f"[{stream_id}] Resuming: Triggering process_file_write.")
+        task_coro = processor.process_file_write()
+        task_name_suffix = f"resume_write_{stream_id[:8]}"
+    else:
         logger.info(
-            f"[{stream_id}] Resuming: stream status '{status or 'active/None'}'. Triggering process_file_write."
+            f"[{stream_id}] Resuming: Stream status '{status}'. No immediate action taken by resume_stream_processing."
         )
+
+    if task_coro:
         asyncio.create_task(
-            processor.process_file_write(), name=f"resume_write_{stream_id[:8]}"
-        )
-    else:  # e.g. "completed", "failed_s3_complete", "aborted_no_parts", "failed_finalization_meta", or specific failed_... from add_stream_to_failed_set
-        logger.info(
-            f"[{stream_id}] Resuming: stream has status '{status}'. No immediate action taken by resume_stream_processing. Stale checker or manual intervention might be needed if it's not a terminal state."
+            _create_and_manage_processor_task(task_coro, stream_id, task_name_suffix)
         )
 
 
 async def main():
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, signal_handler, sig, None)
+
+    # Start Prometheus metrics server in a separate thread
+    await loop.run_in_executor(None, partial(start_metrics_server))
+
     logger.info("Application starting...")
-    watch_dir_str = settings.watch_dir  # Use a local var for clarity
-    stream_timeout = settings.stream_timeout_seconds  # Use a local var
-
-    logger.info(f"Watching directory: {watch_dir_str}")
-    logger.info(
-        f"Stream timeout for IDLE detection: {stream_timeout} seconds (used by stale checker - Phase 5)"
-    )
-
-    watch_dir = Path(watch_dir_str)
-    if not watch_dir.exists():
-        logger.warning(f"Watch directory {watch_dir} does not exist. Creating it.")
-        watch_dir.mkdir(parents=True, exist_ok=True)
-    elif not watch_dir.is_dir():
-        logger.error(f"Watch path {watch_dir} exists but is not a directory. Exiting.")
-        return
-
-    # Use a global event for stopping all main loops if needed, or specific ones.
-    # Let's use one for watcher and one for stale_checker for clarity.
-    watcher_stop_event = asyncio.Event()
-    stale_check_stop_event = asyncio.Event()
-    # Removed global managed_tasks, tasks are managed by their respective stop_events and gather calls.
+    event_queue = asyncio.Queue()
+    stale_check_task = None
+    watcher_task_manager = None
 
     try:
-        await get_redis_connection()  # Initialize Redis connection pool
-
+        await get_redis_connection()
         logger.info("--- Attempting to resume interrupted streams ---")
-        active_ids_to_resume = await get_active_stream_ids()
-        pending_ids_to_resume = await get_pending_completion_stream_ids()
-
-        # Combine and remove duplicates. Note: A stream ID shouldn't be in both ideally.
-        all_ids_to_resume = set(active_ids_to_resume + pending_ids_to_resume)
+        active_ids = await get_active_stream_ids()
+        pending_ids = await get_pending_completion_stream_ids()
+        all_ids_to_resume = set(active_ids + pending_ids)
 
         if all_ids_to_resume:
             logger.info(
-                f"Found {len(all_ids_to_resume)} unique stream IDs to potentially resume: {all_ids_to_resume}"
+                f"Found {len(all_ids_to_resume)} streams to resume: {all_ids_to_resume}"
             )
-            # Create tasks for each resume attempt
-            resume_tasks = [resume_stream_processing(sid) for sid in all_ids_to_resume]
-            # Wait for all resume attempts to complete (or fail)
-            results = await asyncio.gather(*resume_tasks, return_exceptions=True)
-            for sid, result in zip(all_ids_to_resume, results):
-                if isinstance(result, Exception):
-                    logger.error(
-                        f"Error during resume task for stream {sid}: {result}",
-                        exc_info=result,
-                    )
+            resume_futures = [
+                resume_stream_processing(sid) for sid in all_ids_to_resume
+            ]
+            await asyncio.gather(*resume_futures, return_exceptions=True)
         else:
-            logger.info(
-                "No interrupted streams found in 'active' or 'pending_completion' sets to resume."
-            )
+            logger.info("No interrupted streams found to resume.")
         logger.info("--- Resume attempt finished ---")
 
-        logger.info("Starting periodic stale stream checker...")
-        stale_check_task = asyncio.create_task(
-            periodic_stale_stream_check(stale_check_stop_event),
-            name="stale_stream_checker",
+        watch_dir_path = Path(settings.watch_dir)
+        if not watch_dir_path.is_dir():
+            logger.info(
+                f"Watch directory {watch_dir_path} does not exist or is not a directory. Creating it."
+            )
+            watch_dir_path.mkdir(parents=True, exist_ok=True)
+
+        async def run_watcher_loop():
+            async for event_item in video_file_watcher(
+                watch_dir_path, settings.stream_timeout_seconds, shutdown_signal_event
+            ):
+                if shutdown_signal_event.is_set():
+                    break
+                await event_queue.put(event_item)
+            logger.info("Watcher loop has terminated.")
+
+        watcher_task_manager = asyncio.create_task(
+            run_watcher_loop(), name="video_file_watcher_manager"
         )
 
-        logger.info("Starting video file watcher...")
-        watcher_coro = video_file_watcher(watch_dir, stream_timeout, watcher_stop_event)
+        stale_check_task = asyncio.create_task(
+            periodic_stale_stream_check(), name="stale_stream_checker"
+        )
+        logger.info("Watcher and stale stream checker started.")
 
-        async for event in watcher_coro:
-            await handle_stream_event(event)
-
-    except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received. Signaling services to stop...")
-    except Exception as e:
-        logger.critical(f"Unhandled exception in main event loop: {e}", exc_info=True)
-    finally:
-        logger.info("Shutting down services...")
-        watcher_stop_event.set()  # Signal watcher to stop
-        stale_check_stop_event.set()  # Signal stale checker to stop
-
-        # Wait for the stale_check_task to finish
-        if (
-            "stale_check_task" in locals()
-            and stale_check_task
-            and not stale_check_task.done()
-        ):
-            logger.info("Waiting for stale stream checker to complete...")
+        while not shutdown_signal_event.is_set() or not event_queue.empty():
             try:
-                await asyncio.wait_for(
-                    stale_check_task, timeout=settings.stream_timeout_seconds + 5
-                )  # Give it some time
+                event = await asyncio.wait_for(event_queue.get(), timeout=1.0)
+                await handle_stream_event(event, event_queue)
+                event_queue.task_done()
+            except asyncio.TimeoutError:
+                if shutdown_signal_event.is_set() and event_queue.empty():
+                    break
+                continue
+            except asyncio.CancelledError:
+                logger.info("Main event loop cancelled.")
+                break
+
+        logger.info(
+            "Main event loop finished. Waiting for shutdown signal to be fully processed by tasks..."
+        )
+        if not shutdown_signal_event.is_set():
+            await shutdown_signal_event.wait()
+
+    except asyncio.CancelledError:
+        logger.info("Main application task cancelled.")
+    except Exception as e:
+        logger.critical(f"Unhandled exception in main: {e}", exc_info=True)
+    finally:
+        logger.info("Graceful shutdown sequence initiated in main finally block...")
+        if not shutdown_signal_event.is_set():
+            shutdown_signal_event.set()
+
+        tasks_to_await = []
+        if stale_check_task and not stale_check_task.done():
+            stale_check_task.cancel()
+            tasks_to_await.append(stale_check_task)
+        if watcher_task_manager and not watcher_task_manager.done():
+            watcher_task_manager.cancel()
+            tasks_to_await.append(watcher_task_manager)
+
+        active_task_ids = list(active_stream_tasks.keys())
+        for stream_id in active_task_ids:
+            task = active_stream_tasks.get(stream_id)
+            if task and not task.done():
+                logger.info(
+                    f"[{stream_id}] Cancelling active stream task during shutdown."
+                )
+                task.cancel()
+                tasks_to_await.append(task)
+
+        if not event_queue.empty():
+            logger.info(
+                f"Event queue has {event_queue.qsize()} items. Attempting to join..."
+            )
+            try:
+                await asyncio.wait_for(event_queue.join(), timeout=5.0)
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Stale stream checker did not complete in time, cancelling."
-                )
-                stale_check_task.cancel()
-            except asyncio.CancelledError:
-                logger.info("Stale stream checker was cancelled during shutdown.")
-            except Exception as e_sc_wait:
-                logger.error(
-                    f"Error waiting for stale_check_task: {e_sc_wait}", exc_info=True
+                    "Timeout waiting for event queue to join during shutdown."
                 )
 
-        # Cancel any other outstanding tasks (e.g., from handle_stream_event, run_finalization_and_cleanup)
-        # This is a broad cancellation; more targeted cancellation is for Phase 8.
-        current_tasks = [
-            t
-            for t in asyncio.all_tasks()
-            if t is not asyncio.current_task() and not t.done()
-        ]
-        if current_tasks:
+        if tasks_to_await:
             logger.info(
-                f"Cancelling {len(current_tasks)} other outstanding background tasks..."
+                f"Waiting for {len(tasks_to_await)} background tasks to complete shutdown..."
             )
-            for task in current_tasks:
-                task.cancel()
-            try:
-                await asyncio.gather(*current_tasks, return_exceptions=True)
-                logger.info("Other outstanding background tasks cancelled/finished.")
-            except asyncio.CancelledError:  # Can happen if main itself is cancelled
-                logger.info("Task gathering was cancelled.")
-            except Exception as e_gather:
-                logger.error(
-                    f"Error during gathering of cancelled tasks: {e_gather}",
-                    exc_info=True,
-                )
-        else:
-            logger.info("No other outstanding background tasks found.")
+            await asyncio.gather(*tasks_to_await, return_exceptions=True)
 
+        # Ensure any remaining processors are cleared and gauge decremented if not already
+        remaining_processors = list(active_processors.keys())
+        for proc_path in remaining_processors:
+            processor = active_processors.pop(proc_path, None)
+            if processor:
+                ACTIVE_STREAMS_GAUGE.dec()
+                logger.info(
+                    "Decremented active streams gauge for remaining processor during final shutdown",
+                    stream_id=processor.stream_id,
+                )
+        logger.info("All tasks awaited. Closing resources.")
         await close_redis_connection()
         await close_s3_resources()
-        logger.info("Application stopped.")
+        logger.info("Application stopped gracefully.")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Application launch interrupted by user.")
+        logger.info(
+            "Application interrupted by user (KeyboardInterrupt outside asyncio loop)."
+        )
+    except Exception as e:
+        logger.critical(
+            f"Application exited with unhandled exception: {e}", exc_info=True
+        )

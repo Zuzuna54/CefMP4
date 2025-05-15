@@ -23,6 +23,9 @@ CefMP4 Stream Processor monitors a specified directory for MP4 video files. When
   - [Phase 5: Stream Finalization & S3 Completion](#phase-5-stream-finalization--s3-completion)
 - [Testing](#testing)
 - [Development Notes](#development-notes)
+- [Observability](#observability)
+  - [Logging](#logging)
+  - [Metrics](#metrics)
 
 ## Prerequisites
 
@@ -226,6 +229,38 @@ The application processes video files in several stages, evolving through develo
     - `abort_s3_multipart_upload()`: Aborts an ongoing S3 upload.
   - `src/redis_client.py`: Functions to get all active stream IDs, move streams to pending completion, and update final statuses.
 
+### Phase 6: Metadata Generation (ffprobe & JSON)
+
+- **Goal**: After successful S3 multipart upload, use `ffprobe` to get video duration, gather all metadata, create a JSON metadata file, and upload it to S3.
+- **Key Components**:
+  - `Dockerfile`: Modified to install `ffmpeg` (which provides `ffprobe`).
+  - `src/utils/ffprobe_utils.py`:
+    - `get_video_duration()`: Utility to run `ffprobe` asynchronously and extract video duration in seconds.
+  - `src/metadata_generator.py`:
+    - `generate_metadata_json()`: Gathers information from Redis (stream metadata, part details including `UploadedAtUTC`) and `ffprobe` (duration). Constructs a comprehensive JSON object for the stream, including `stream_id`, file paths, S3 details, total size, duration, timestamps, and detailed chunk information.
+  - `src/redis_client.py`:
+    - `get_stream_parts()`: Provides detailed part information, including `UploadedAtUTC`, necessary for the metadata JSON.
+  - `src/s3_client.py`:
+    - `upload_json_to_s3()`: Uploads the generated JSON metadata file to the S3 bucket, typically alongside the processed video stream.
+  - `src/stream_processor.py`:
+    - `finalize_stream()`: Integrates metadata generation (calling `generate_metadata_json`) and S3 upload (calling `upload_json_to_s3`) after a successful S3 multipart upload completion. Updates stream status in Redis to reflect metadata status (e.g., "completed_with_meta").
+  - `src/config.py`: The `ffprobe_path` setting allows specifying a custom `ffprobe` binary location if needed.
+
+### Phase 7: Checkpoint Recovery & Resume Logic
+
+- **Goal**: Enable the application to recover and resume processing of incomplete streams (those in "active" or "pending_completion" states in Redis) upon startup.
+- **Key Components**:
+  - `src/redis_client.py`:
+    - `get_active_stream_ids()`, `get_pending_completion_stream_ids()`: Retrieve lists of stream IDs that were being processed or awaiting finalization before shutdown.
+    - `get_stream_meta()`, `get_stream_parts()`, `get_stream_next_part()`, `get_stream_bytes_sent()`: Provide all necessary checkpoint data (original path, S3 upload details, part information, next part number, total bytes sent) for a given stream ID.
+    - `add_stream_to_failed_set()`: Manages streams that cannot be resumed (e.g., if the original file is missing on startup).
+  - `src/stream_processor.py`:
+    - `_initialize_from_checkpoint()`: Fully implemented to re-hydrate the processor's state (file offset, next part number, S3 details, list of already uploaded parts) by fetching data from Redis using the stream ID. It robustly handles cases like missing original files by marking the stream as failed.
+  - `src/main.py`:
+    - `resume_stream_processing()`: A function called during application startup for each potentially resumable stream ID. It fetches metadata, instantiates a `StreamProcessor`, calls `_initialize_from_checkpoint()` on it, and then, based on the recovered stream status (e.g., "active", "pending_completion"), schedules the appropriate follow-up action (e.g., `processor.process_file_write()` to check for more data, or `processor.finalize_stream()` to attempt completion).
+    - Startup Sequence: The main application startup logic first attempts to resume any interrupted streams before initiating new file watching or other periodic tasks.
+  - Idempotency: Operations are designed to be idempotent where possible, or state checks are performed to prevent issues if an operation is re-tried during resume (e.g., not re-finalizing an already completed stream).
+
 ## Testing
 
 Unit and integration tests are located in the `tests/` directory and can be run using `pytest`.
@@ -253,3 +288,41 @@ Unit and integration tests are located in the `tests/` directory and can be run 
 - Error handling and retry mechanisms for S3/Redis operations are progressively added throughout the phases.
 - State management is crucial: Redis is the source of truth for stream progress and S3 upload details.
 - Idempotency for operations is important, especially for recovery scenarios (covered in later phases).
+
+## Observability
+
+### Logging
+
+The application uses `structlog` for structured logging.
+
+- In `development` mode (`APP_ENV=development`), logs are pretty-printed to the console.
+- In `production` mode (`APP_ENV=production`), logs are formatted as JSON, suitable for ingestion into log management systems.
+
+Key log attributes include `timestamp`, `level`, `logger_name`, `event` (the log message), and any bound context variables like `stream_id` and `file_path`.
+
+The log level can be configured via the `LOG_LEVEL` environment variable (e.g., `INFO`, `DEBUG`, `WARNING`). Default is `INFO`.
+
+### Metrics
+
+The application exports Prometheus metrics on port `${PROM_PORT}` (default `8000`) at the `/metrics` endpoint (e.g., `http://localhost:8000/metrics`).
+
+Key exposed metrics include:
+
+- `video_chunks_uploaded_total{stream_id}`: Total number of video chunks successfully uploaded per stream.
+- `video_bytes_uploaded_total{stream_id}`: Total number of bytes successfully uploaded per stream.
+- `video_stream_duration_seconds{stream_id}`: Histogram of processed video stream durations.
+- `video_processing_time_seconds{stream_id}`: Histogram of time taken to process video streams.
+- `video_failed_operations_total{stream_id, operation_type}`: Counter for failed operations (e.g., s3_upload, redis_update).
+- `active_streams_gauge`: Current number of actively processing streams.
+- `streams_completed_total`: Total number of streams successfully processed.
+- `streams_failed_total`: Total number of streams that ended in a failed state.
+
+**Sample Prometheus Scrape Configuration:**
+
+```yaml
+# prometheus.yml example snippet
+scrape_configs:
+  - job_name: "cefmp4-processor"
+    static_configs:
+      - targets: ["localhost:8000"] # Adjust target to your app's host and PROM_PORT
+```

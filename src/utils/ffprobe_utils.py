@@ -1,9 +1,9 @@
 import asyncio
-import json
-import logging
+import structlog
 from src.config import settings
+from src.exceptions import FFprobeError
 
-logger = logging.getLogger(__name__)  # To be replaced by structlog
+logger = structlog.get_logger(__name__)
 
 
 async def get_video_duration(file_path: str) -> float | None:
@@ -19,7 +19,9 @@ async def get_video_duration(file_path: str) -> float | None:
         "default=noprint_wrappers=1:nokey=1",
         file_path,
     ]
-    logger.debug(f"Running ffprobe for duration: {' '.join(args)}")
+    logger.debug(
+        "Running ffprobe for duration", command=" ".join(args), file_path=file_path
+    )
     try:
         process = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -28,19 +30,39 @@ async def get_video_duration(file_path: str) -> float | None:
 
         if process.returncode == 0 and stdout:
             duration_str = stdout.decode().strip()
-            logger.debug(f"ffprobe stdout for duration: {duration_str}")
-            return float(duration_str)
+            logger.debug(
+                "ffprobe stdout for duration", output=duration_str, file_path=file_path
+            )
+            try:
+                return float(duration_str)
+            except ValueError as ve:
+                err_msg = f"ffprobe output is not a valid float: {duration_str}"
+                logger.error(
+                    err_msg,
+                    file_path=file_path,
+                    raw_output=duration_str,
+                    error_details=str(ve),
+                )
+                raise FFprobeError(f"{err_msg}. Error: {ve}")
         else:
             stderr_str = stderr.decode().strip()
+            err_msg = f"ffprobe error (return code {process.returncode})"
             logger.error(
-                f"ffprobe error for {file_path} (return code {process.returncode}): {stderr_str}"
+                err_msg,
+                file_path=file_path,
+                return_code=process.returncode,
+                stderr=stderr_str,
             )
-            return None
+            raise FFprobeError(f"{err_msg}: {stderr_str}")
     except FileNotFoundError:
-        logger.error(
-            f"ffprobe command not found (path: '{ffprobe_cmd}'). Ensure ffmpeg is installed and ffprobe is in PATH or FFPROBE_PATH is set correctly."
-        )
-        return None
+        err_msg = f"ffprobe command not found. Ensure ffmpeg is installed or FFPROBE_PATH is set."
+        logger.error(err_msg, ffprobe_command=ffprobe_cmd)
+        raise FFprobeError(f"{err_msg} Command: '{ffprobe_cmd}'")
+    except asyncio.CancelledError:
+        logger.info("ffprobe execution cancelled", file_path=file_path)
+        raise
     except Exception as e:
-        logger.error(f"Error running ffprobe for {file_path}: {e}", exc_info=True)
-        return None
+        logger.error(
+            "Unexpected error running ffprobe", file_path=file_path, exc_info=e
+        )
+        raise FFprobeError(f"Unexpected error running ffprobe for {file_path}: {e}")

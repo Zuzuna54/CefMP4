@@ -15,6 +15,14 @@ COPY src /app/src
 RUN useradd --create-home appuser
 USER appuser
 
-# Set up entrypoint and default command
-ENTRYPOINT ["dumb-init", "--"]
-CMD ["python", "-m", "src.main"] # Assuming a main.py will exist 
+# Expose Prometheus metrics port
+ARG PROM_PORT=8000
+ENV PROM_PORT=$PROM_PORT
+EXPOSE ${PROM_PORT}
+
+# Set the entrypoint and command
+# Ensure the user has permissions to write to any necessary directories if not running as root
+# USER appuser # Example if a non-root user is setup
+
+ENTRYPOINT ["python", "-m", "src.main"]
+# CMD is not strictly needed if ENTRYPOINT is a list like above and main.py handles all logic 

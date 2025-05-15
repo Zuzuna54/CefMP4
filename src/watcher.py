@@ -1,14 +1,13 @@
 import asyncio
-import logging
+import structlog
 from pathlib import Path
 from typing import AsyncGenerator
 
 from watchfiles import awatch, Change
 
-from .config import settings
 from .events import StreamEvent, WatcherChangeType
 
-logger = logging.getLogger(__name__)  # Will be replaced by structlog
+logger = structlog.get_logger(__name__)
 
 # Keep track of files and their last modification times and active status
 # Key: file_path (str), Value: last_event_is_write (bool)
@@ -37,7 +36,11 @@ async def video_file_watcher(
 
             if change_type_raw == Change.added:
                 if file_path_str not in _active_files_last_event_write:
-                    logger.info(f"New file detected (CREATE): {file_path}")
+                    logger.info(
+                        "New file detected",
+                        event_type="CREATE",
+                        file_path=str(file_path),
+                    )
                     _active_files_last_event_write[file_path_str] = (
                         False  # Initial event is add, not write
                     )
@@ -50,7 +53,11 @@ async def video_file_watcher(
             elif change_type_raw == Change.modified:
                 if file_path_str not in _active_files_last_event_write:
                     # File appeared and was immediately modified (e.g. SCP)
-                    logger.info(f"New file detected via modify (CREATE): {file_path}")
+                    logger.info(
+                        "New file detected",
+                        event_type="CREATE",
+                        file_path=str(file_path),
+                    )
                     _active_files_last_event_write[file_path_str] = True
                     yield StreamEvent(
                         change_type=WatcherChangeType.CREATE, file_path=file_path
@@ -60,14 +67,18 @@ async def video_file_watcher(
                         change_type=WatcherChangeType.WRITE, file_path=file_path
                     )
                 else:
-                    logger.info(f"File modified (WRITE): {file_path}")
+                    logger.info(
+                        "File modified", event_type="WRITE", file_path=str(file_path)
+                    )
                     _active_files_last_event_write[file_path_str] = True
                     yield StreamEvent(
                         change_type=WatcherChangeType.WRITE, file_path=file_path
                     )
 
             elif change_type_raw == Change.deleted:
-                logger.info(f"File deleted (DELETE): {file_path}")
+                logger.info(
+                    "File deleted", event_type="DELETE", file_path=str(file_path)
+                )
                 if file_path_str in _active_files_last_event_write:
                     del _active_files_last_event_write[file_path_str]
                 yield StreamEvent(

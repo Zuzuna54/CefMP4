@@ -4,12 +4,18 @@ version = "0.1.0"
 description = "Monitors MP4 video streams, processes them in chunks, and uploads to S3."
 requires-python = ">=3.12"
 dependencies = [
-    "pydantic-settings",
-    "python-dotenv",
-    "watchfiles",
-    "redis[hiredis] >= 4.0.0",
-    "aioboto3",
+    "pydantic-settings>=2.0.0,<3.0.0",
+    "python-dotenv>=1.0.0,<2.0.0",
+    "watchfiles>=0.20.0,<1.0.0",
+    "redis[hiredis]>=5.0.1,<6.0.0",
+    "aioboto3>=12.3.0,<15.0.0",
+    "aiofiles>=23.2.1,<25.0.0",
+    "uvloop>=0.17.0,<1.0.0",
+    "tenacity>=8.2.3,<9.0.0",
+    "pydantic>=2.5.0,<3.0.0",
     # Other core dependencies will be added in later phases
+    "structlog>=23.0.0,<26.0.0",
+    "prometheus_client>=0.17.0,<1.0.0"
 ]
 
 [tool.ruff]
@@ -25,4 +31,7 @@ python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true # Initially, can be stricter later
-# Add paths if needed, e.g., mypy_path = "src" 
+# Add paths if needed, e.g., mypy_path = "src"
+
+[tool.pytest.ini_options]
+# ... existing code ... 
